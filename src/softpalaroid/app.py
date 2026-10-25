@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
@@ -29,9 +30,12 @@ def main(argv: list[str] | None = None) -> int:
         window.setWindowIcon(QIcon(icon))
     # Фото, переданное первым аргументом командной строки, открывается в слот 1
     args = app.arguments()[1:]
+    loaded_cli_photo = False
     if args and os.path.isfile(args[0]):
-        window._load_photo_into(0, args[0])  # noqa: SLF001
+        loaded_cli_photo = window._load_photo_into(0, args[0])  # noqa: SLF001
     window.show()
+    if not loaded_cli_photo:
+        QTimer.singleShot(0, window.offer_autosave_recovery)
     return app.exec()
 
 

@@ -111,6 +111,12 @@ QPushButton, QToolButton {
 }
 QPushButton:hover, QToolButton:hover { background-color: rgba(231,233,234,0.10); }
 QPushButton:pressed, QToolButton:pressed { background-color: rgba(231,233,234,0.20); }
+QPushButton:disabled, QToolButton:disabled {
+    color: #71767B; border-color: #2F3336; background-color: transparent;
+}
+QPushButton#primaryButton:disabled {
+    color: #8ECDF7; background-color: #0D4D73;
+}
 QPushButton#primaryButton {
     background-color: #1D9BF0; border: none; color: #FFFFFF; font-size: 14px;
     border-radius: 20px;
