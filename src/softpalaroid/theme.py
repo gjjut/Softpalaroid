@@ -128,6 +128,7 @@ QPushButton#whiteButton {
 }
 QPushButton#whiteButton:hover { background-color: #D7DBDC; }
 QToolButton#moreButton { padding: 4px 10px; font-size: 16px; }
+QToolButton#iconButton { padding: 0; font-size: 16px; }
 QToolButton::menu-indicator { image: none; width: 0; }
 
 /* --- сегментные переключатели --- */
@@ -143,6 +144,41 @@ QPushButton[segment="true"]:hover { background-color: #1D1F23; }
 QPushButton[segment="true"]:checked {
     background-color: #1D9BF0; border-color: #1D9BF0; color: #FFFFFF;
 }
+
+/* --- сворачиваемые разделы, визуальные выборы и лента слотов --- */
+QPushButton[sectionHeader="true"] {
+    background-color: transparent;
+    border: none;
+    border-radius: 8px;
+    padding: 5px 4px;
+    text-align: left;
+    font-size: 15px;
+    font-weight: 800;
+    color: #E7E9EA;
+}
+QPushButton[sectionHeader="true"]:hover { background-color: #16181C; }
+QScrollArea#choiceStrip, QScrollArea#slotStrip {
+    background-color: transparent;
+    border: none;
+}
+QToolButton[choiceButton="true"], QToolButton[slotButton="true"] {
+    background-color: #16181C;
+    border: 1px solid #2F3336;
+    border-radius: 12px;
+    padding: 5px 4px;
+    font-size: 11px;
+    font-weight: 700;
+    color: #E7E9EA;
+}
+QToolButton[choiceButton="true"]:hover, QToolButton[slotButton="true"]:hover {
+    border-color: #536471; background-color: #1D1F23;
+}
+QToolButton[choiceButton="true"]:checked, QToolButton[slotButton="true"]:checked {
+    border: 2px solid #1D9BF0; background-color: rgba(29,155,240,0.16);
+}
+QToolButton[slotButton="true"][slotState="warning"] { color: #FFD166; }
+QToolButton[slotButton="true"][slotState="error"] { color: #FF7A93; }
+QToolButton[slotButton="true"][slotState="empty"] { color: #71767B; }
 
 /* --- поля ввода и списки --- */
 QLineEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
@@ -170,7 +206,7 @@ QComboBox::drop-down { width: 24px; border: none; background: transparent; }
 QComboBox::down-arrow {
     image: url("__CHEVRON_DOWN__"); width: 12px; height: 12px;
 }
-QComboBox QAbstractItemView {
+QComboBox QAbstractItemView, QCompleter QAbstractItemView {
     background-color: #16181C;
     border: 1px solid #2F3336;
     selection-background-color: #1D9BF0;

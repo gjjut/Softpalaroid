@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw  # noqa: E402
 from PySide6.QtGui import QFontDatabase, QImage  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+from softpalaroid.filters import FILTERS  # noqa: E402
 from softpalaroid.main_window import IMAGE_FILTER, MainWindow  # noqa: E402
 from softpalaroid.render import save_sheet  # noqa: E402
 from softpalaroid.theme import apply_theme  # noqa: E402
@@ -154,6 +155,91 @@ def main() -> None:
         assert win.project.items[1].photo_size == (320, 240)
         assert "Проверка макета" in win.preflight_label.text()
         assert not win._is_dirty()  # noqa: SLF001
+
+        _stage("UX galleries / accordions / slot strip / search")
+        win.canvas.select(0)
+        app.processEvents()
+        assert win.panel_scroll.width() == 404
+        assert set(win._section_cards) == {  # noqa: SLF001
+            "sheet", "card", "caption", "style", "output", "hints"}
+
+        sheet_card = win._section_cards["sheet"]  # noqa: SLF001
+        sheet_was_expanded = sheet_card.is_expanded()
+        sheet_card.set_expanded(not sheet_was_expanded)
+        app.processEvents()
+        assert sheet_card.is_expanded() is (not sheet_was_expanded)
+        assert sheet_card.body.isVisible() is (not sheet_was_expanded)
+        sheet_card.set_expanded(sheet_was_expanded)
+        win._set_all_sections_expanded(False)  # noqa: SLF001
+        assert not any(card.is_expanded()
+                       for card in win._section_cards.values())  # noqa: SLF001
+        win._set_all_sections_expanded(True)  # noqa: SLF001
+        assert all(card.is_expanded()
+                   for card in win._section_cards.values())  # noqa: SLF001
+
+        assert len(win._slot_buttons) == len(win.project.items)  # noqa: SLF001
+        assert not win._slot_buttons[0].icon().isNull()  # noqa: SLF001
+        assert any(button.property("slotState") == "warning"
+                   for button in win._slot_buttons)  # noqa: SLF001
+        win._slot_buttons[2].click()  # noqa: SLF001
+        app.processEvents()
+        assert win._selected_index() == 2  # noqa: SLF001
+        assert win._slot_buttons[2].isChecked()  # noqa: SLF001
+        win._select_relative_card(1)  # noqa: SLF001
+        assert win._selected_index() == 3  # noqa: SLF001
+        win._select_relative_card(1)  # noqa: SLF001
+        assert win._selected_index() == 0  # noqa: SLF001
+        assert win.act_previous_card.shortcut().toString() == "Ctrl+Shift+Tab"
+        assert win.act_next_card.shortcut().toString() == "Ctrl+Tab"
+        assert win.act_search_panel.shortcut().toString() == "Ctrl+K"
+
+        win.paper_gallery._activate("13x18")  # noqa: SLF001
+        app.processEvents()
+        assert win.project.paper_size == "13x18"
+        assert win.paper_combo.currentData() == "13x18"
+        assert win.paper_gallery.current_key() == "13x18"
+        assert str(win._settings.value(  # noqa: SLF001
+            "projectDefaults/paper_size")) == "13x18"
+
+        win.format_gallery._activate("instax_square")  # noqa: SLF001
+        app.processEvents()
+        assert win.project.card_format == "instax_square"
+        assert win.card_format_combo.currentData() == "instax_square"
+        assert win.format_gallery.current_key() == "instax_square"
+
+        win.template_gallery._activate("pastel")  # noqa: SLF001
+        assert win.template_combo.currentData() == "pastel"
+        assert win.project.template == "warm_film"  # выбор ещё не применён
+        win._apply_template()  # noqa: SLF001
+        assert win.project.template == "pastel"
+        assert win.template_gallery.current_key() == "pastel"
+
+        win.canvas.select(0)
+        assert win.canvas.filter_base_image(0) is not None
+        win._refresh_filter_gallery()  # noqa: SLF001
+        assert len(win.filter_gallery._buttons) == len(FILTERS)  # noqa: SLF001
+        assert win.filter_gallery.current_key() == win.project.items[0].filter
+        win.filter_gallery._activate("bw")  # noqa: SLF001
+        app.processEvents()
+        assert win.project.items[0].filter == "bw"
+        assert win.filter_combo.currentData() == "bw"
+        assert win.filter_gallery.current_key() == "bw"
+
+        win._set_all_sections_expanded(False)  # noqa: SLF001
+        win.panel_search.setText("Цвет рамки")
+        win._activate_search_result(win.panel_search.text())  # noqa: SLF001
+        for _ in range(5):
+            app.processEvents()
+        assert win._section_cards["style"].is_expanded()  # noqa: SLF001
+        assert win.focusWidget() is win.frame_color_button
+        win.canvas.select(0)
+        win._activate_search_result("Следующая")  # noqa: SLF001
+        assert win._selected_index() == 1  # noqa: SLF001
+        for key, expanded in {
+                "sheet": True, "card": True, "caption": False,
+                "style": False, "output": True, "hints": False}.items():
+            win._section_cards[key].set_expanded(expanded)  # noqa: SLF001
+        win.canvas.select(0)
 
         _stage("return to classic 10x15 for final export")
         paper_idx = win.paper_combo.findData("10x15")
