@@ -30,7 +30,7 @@ def _make_photo(path: str) -> tuple[int, int]:
 
 class TestProjectIO(unittest.TestCase):
     def _project(self, photo: str, size: tuple[int, int]) -> Project:
-        project = Project()
+        project = Project(background_color="#f6efe5", cut_marks=False)
         project.set_layout(2, landscape=True)
         for i, item in enumerate(project.items):
             item.set_photo(photo, size)
@@ -40,6 +40,9 @@ class TestProjectIO(unittest.TestCase):
             item.zoom = 1.2
             item.offset_x = 0.4
             item.offset_y = 0.6
+            item.photo_rotation = 90
+            item.flip_horizontal = True
+            item.frame_color = "#ffe1e8"
         return project
 
     def test_roundtrip_embeds_and_deduplicates_photo(self) -> None:
@@ -62,6 +65,8 @@ class TestProjectIO(unittest.TestCase):
             self.assertEqual(loaded.selected_index, 1)
             self.assertEqual(loaded.warnings, [])
             self.assertTrue(loaded.project.landscape)
+            self.assertEqual(loaded.project.background_color, "#f6efe5")
+            self.assertFalse(loaded.project.cut_marks)
             self.assertEqual(len(loaded.project.items), 2)
             first = loaded.project.items[0]
             self.assertEqual(first.caption, "Фото 1")
@@ -69,6 +74,10 @@ class TestProjectIO(unittest.TestCase):
             self.assertAlmostEqual(first.rotation, -2.0)
             self.assertAlmostEqual(first.zoom, 1.2)
             self.assertAlmostEqual(first.offset_x, 0.4)
+            self.assertEqual(first.photo_rotation, 90)
+            self.assertTrue(first.flip_horizontal)
+            self.assertFalse(first.flip_vertical)
+            self.assertEqual(first.frame_color, "#ffe1e8")
             self.assertIsNotNone(first.photo_path)
             self.assertTrue(os.path.isfile(first.photo_path))
             self.assertEqual(first.photo_size, size)
@@ -107,6 +116,27 @@ class TestProjectIO(unittest.TestCase):
                 stripped, os.path.join(tmp, "extract"))
             self.assertTrue(loaded.warnings)
             self.assertIsNone(loaded.project.items[0].photo_path)
+
+    def test_legacy_v1_gets_safe_defaults_for_new_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            filename = os.path.join(tmp, "legacy.softpalaroid")
+            manifest = {
+                "format": "softpalaroid-project",
+                "version": 1,
+                "landscape": True,
+                "selected_index": 0,
+                "items": [{"center_x": 500, "center_y": 500, "width": 600}],
+                "metadata": {},
+            }
+            with zipfile.ZipFile(filename, "w") as zf:
+                zf.writestr(MANIFEST_NAME, json.dumps(manifest))
+            loaded = load_project_file(filename, os.path.join(tmp, "extract"))
+            self.assertEqual(loaded.project.background_color, "#ffffff")
+            self.assertTrue(loaded.project.cut_marks)
+            item = loaded.project.items[0]
+            self.assertEqual(item.photo_rotation, 0)
+            self.assertFalse(item.flip_horizontal)
+            self.assertEqual(item.frame_color, "#fcfcfa")
 
     def test_unsafe_image_path_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
