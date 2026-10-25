@@ -87,6 +87,7 @@ class CanvasWidget(QWidget):
         self.project: Project | None = None
         self.selected: int = 0
         self._pixmaps: dict[int, QPixmap] = {}
+        self._filter_bases: dict[int, object] = {}
 
         self._view_zoom = 1.0
         self._pan = QPointF(0.0, 0.0)
@@ -112,6 +113,7 @@ class CanvasWidget(QWidget):
         self.project = project
         self.selected = 0
         self._pixmaps.clear()
+        self._filter_bases.clear()
         for i in range(len(project.items)):
             self.refresh_item_pixmap(i)
         self.reset_view()
@@ -122,6 +124,8 @@ class CanvasWidget(QWidget):
             return
         n = len(self.project.items)
         self._pixmaps = {i: p for i, p in self._pixmaps.items() if i < n}
+        self._filter_bases = {
+            i: p for i, p in self._filter_bases.items() if i < n}
         for i in range(n):
             if i not in self._pixmaps and self.project.items[i].photo_path:
                 self.refresh_item_pixmap(i)
@@ -136,11 +140,13 @@ class CanvasWidget(QWidget):
         item = self.project.items[index]
         if not item.photo_path:
             self._pixmaps.pop(index, None)
+            self._filter_bases.pop(index, None)
             return
         try:
             img = load_photo(item.photo_path)
         except Exception:  # noqa: BLE001 - битый/пропавший файл = пустой слот
             self._pixmaps.pop(index, None)
+            self._filter_bases.pop(index, None)
             self.update()
             return
         item.photo_size = img.size
@@ -158,6 +164,12 @@ class CanvasWidget(QWidget):
             saturation=item.saturation,
             sharpness=item.sharpness,
         )
+        # Небольшая копия до фильтра нужна визуальной галерее фильтров:
+        # она показывает каждый фильтр на текущем фото, а не на абстрактной
+        # картинке. Полноразмерный экспорт при этом не затрагивается.
+        filter_base = img.copy()
+        filter_base.thumbnail((320, 320))
+        self._filter_bases[index] = filter_base
         img = apply_filter(
             img, item.filter,
             seed=item.effective_grain_seed(),
@@ -173,11 +185,21 @@ class CanvasWidget(QWidget):
     def refresh_all_pixmaps(self) -> None:
         """Перечитать превью всех слотов (после Undo/Redo или открытия проекта)."""
         self._pixmaps.clear()
+        self._filter_bases.clear()
         if self.project is None:
             return
         for i in range(len(self.project.items)):
             self.refresh_item_pixmap(i)
         self.update()
+
+    def preview_pixmap(self, index: int) -> QPixmap | None:
+        """Текущее превью слота для ленты карточек."""
+        return self._pixmaps.get(index)
+
+    def filter_base_image(self, index: int):
+        """Копия фото после ориентации/коррекций, но до плёночного фильтра."""
+        base = self._filter_bases.get(index)
+        return base.copy() if base is not None else None
 
     def select(self, index: int) -> None:
         if index != self.selected:
@@ -827,6 +849,14 @@ class CanvasWidget(QWidget):
             return
         if key == Qt.Key.Key_V and e.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.pasteRequested.emit(self.selected)
+            e.accept()
+            return
+        if key in {Qt.Key.Key_PageDown, Qt.Key.Key_BracketRight}:
+            self.select((self.selected + 1) % len(self.project.items))
+            e.accept()
+            return
+        if key in {Qt.Key.Key_PageUp, Qt.Key.Key_BracketLeft}:
+            self.select((self.selected - 1) % len(self.project.items))
             e.accept()
             return
         if key in {Qt.Key.Key_Left, Qt.Key.Key_Right,

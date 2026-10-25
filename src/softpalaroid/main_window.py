@@ -6,7 +6,7 @@ import os
 import tempfile
 from datetime import datetime
 
-from PIL import UnidentifiedImageError
+from PIL import Image as PilImage, ImageDraw as PilDraw, UnidentifiedImageError
 from PySide6.QtCore import (
     QRect,
     QRectF,
@@ -14,19 +14,23 @@ from PySide6.QtCore import (
     QSize,
     QSizeF,
     QStandardPaths,
+    QStringListModel,
     QTimer,
     Qt,
 )
 from PySide6.QtGui import (
     QAction,
+    QBrush,
     QCloseEvent,
     QColor,
     QDragEnterEvent,
     QDropEvent,
+    QIcon,
     QImage,
     QKeySequence,
     QPageSize,
     QPainter,
+    QPen,
     QPixmap,
 )
 from PySide6.QtPrintSupport import QPrintPreviewDialog, QPrinter
@@ -35,6 +39,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QColorDialog,
     QComboBox,
+    QCompleter,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
@@ -62,7 +67,7 @@ from . import __version__
 from .canvas import CanvasWidget
 from .batch import BatchOptions, export_batch
 from .dialogs import BatchDialog, PreflightDialog
-from .filters import FILTERS
+from .filters import FILTERS, apply_filter
 from .model import (
     CARD_FORMATS,
     MAX_CARDS,
@@ -89,6 +94,7 @@ from .preflight import analyze_project, issue_counts
 from .render import render_sheet, save_card, save_sheet
 from .templates import DESIGN_TEMPLATES, apply_design_template
 from .resources import asset_path
+from .widgets import ChoiceItem, CollapsibleCard, VisualChoiceStrip
 
 IMAGE_FILTER = image_file_filter()
 SHEET_COLOR_PRESETS = ("#ffffff", "#f6efe5", "#e7e9ea", "#dceeff", "#16181c")
@@ -110,6 +116,7 @@ class MainWindow(QMainWindow):
 
         # Состояние проекта, истории и автосохранения
         self._settings = QSettings("Softpalaroid", "Softpalaroid")
+        self._apply_saved_project_defaults(self.project)
         self._project_path: str | None = None
         self._project_tempdir: tempfile.TemporaryDirectory | None = None
         self._saved_state_key: str | None = project_state_key(self.project)
@@ -122,6 +129,12 @@ class MainWindow(QMainWindow):
         self._subtitle_label: QLabel | None = None
         self._style_clipboard: dict | None = None
         self._adjustment_controls: dict[str, tuple[QSlider, QDoubleSpinBox, int]] = {}
+        self._section_cards: dict[str, CollapsibleCard] = {}
+        self._slot_buttons: list[QToolButton] = []
+        self._slot_icon_keys: dict[int, tuple] = {}
+        self._search_targets: dict[str, object] = {}
+        self._filter_gallery_key: tuple | None = None
+        self._filter_sample_cache: PilImage.Image | None = None
 
         self._history_timer = QTimer(self)
         self._history_timer.setSingleShot(True)
@@ -132,6 +145,11 @@ class MainWindow(QMainWindow):
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.setInterval(1500)
         self._autosave_timer.timeout.connect(self._write_autosave)
+
+        self._filter_gallery_timer = QTimer(self)
+        self._filter_gallery_timer.setSingleShot(True)
+        self._filter_gallery_timer.setInterval(250)
+        self._filter_gallery_timer.timeout.connect(self._refresh_filter_gallery)
 
         self.canvas = CanvasWidget()
         self.canvas.set_project(self.project)
@@ -167,8 +185,8 @@ class MainWindow(QMainWindow):
 
         self.statusBar().setSizeGripEnabled(False)
         self.statusBar().showMessage(
-            "Колесо мыши — масштаб фото • Shift+колесо — наклон • "
-            "Ctrl+колесо — масштаб просмотра • Delete — удалить карточку")
+            "Ctrl+K — поиск настройки • Ctrl+Tab — следующая карточка • "
+            "колесо мыши — масштаб фото • Ctrl+колесо — масштаб просмотра")
         self._sync_layout_controls()
         self._sync_panel()
         self._update_project_ui()
@@ -214,6 +232,20 @@ class MainWindow(QMainWindow):
         self.act_batch.setShortcut("Ctrl+Shift+B")
         self.act_batch.triggered.connect(self._batch_dialog)
 
+        self.act_search_panel = QAction("Найти настройку или действие…", self)
+        self.act_search_panel.setShortcut("Ctrl+K")
+        self.act_search_panel.triggered.connect(self._focus_panel_search)
+
+        self.act_previous_card = QAction("Предыдущая карточка", self)
+        self.act_previous_card.setShortcut("Ctrl+Shift+Tab")
+        self.act_previous_card.triggered.connect(
+            lambda: self._select_relative_card(-1))
+
+        self.act_next_card = QAction("Следующая карточка", self)
+        self.act_next_card.setShortcut("Ctrl+Tab")
+        self.act_next_card.triggered.connect(
+            lambda: self._select_relative_card(1))
+
         self.act_undo = QAction("Отменить", self)
         self.act_undo.setShortcut("Ctrl+Z")
         self.act_undo.triggered.connect(self._undo)
@@ -237,8 +269,96 @@ class MainWindow(QMainWindow):
             self.act_save_project, self.act_save_project_as,
             self.act_open, self.act_export, self.act_print,
             self.act_preflight, self.act_batch,
+            self.act_search_panel, self.act_previous_card, self.act_next_card,
             self.act_undo, self.act_redo, self.act_about, self.act_quit,
         ])
+
+    # ------------------------------------------- запоминаемые параметры листа
+    @staticmethod
+    def _as_setting_bool(value: object, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+        return default if value is None else bool(value)
+
+    @staticmethod
+    def _as_setting_float(value: object, default: float) -> float:
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+
+    def _remember_project_defaults(self) -> None:
+        """Запомнить формат листа/карточек для следующих новых проектов."""
+        values = {
+            "enabled": True,
+            "paper_size": self.project.paper_size,
+            "sheet_width_cm": self.project.sheet_width_cm,
+            "sheet_height_cm": self.project.sheet_height_cm,
+            "landscape": self.project.landscape,
+            "card_format": self.project.card_format,
+            "template": self.project.template,
+            "background_color": self.project.background_color,
+            "cut_marks": self.project.cut_marks,
+            "safe_margin_mm": self.project.safe_margin_mm,
+            "show_safe_area": self.project.show_safe_area,
+            "snap_enabled": self.project.snap_enabled,
+        }
+        for key, value in values.items():
+            self._settings.setValue(f"projectDefaults/{key}", value)
+        self._settings.sync()
+
+    def _apply_saved_project_defaults(self, project: Project) -> None:
+        if not self._as_setting_bool(
+                self._settings.value("projectDefaults/enabled", False), False):
+            return
+
+        def value(key: str, default: object) -> object:
+            return self._settings.value(f"projectDefaults/{key}", default)
+
+        landscape = self._as_setting_bool(
+            value("landscape", project.landscape), project.landscape)
+        paper = str(value("paper_size", project.paper_size))
+        if paper in PAPER_SIZES:
+            project.set_paper_size(paper, landscape=landscape)
+        elif paper == "custom":
+            project.set_sheet_dimensions(
+                self._as_setting_float(
+                    value("sheet_width_cm", project.sheet_width_cm),
+                    project.sheet_width_cm),
+                self._as_setting_float(
+                    value("sheet_height_cm", project.sheet_height_cm),
+                    project.sheet_height_cm),
+                paper_size="custom")
+            project.landscape = landscape
+
+        card_format = str(value("card_format", project.card_format))
+        if card_format in CARD_FORMATS:
+            project.card_format = card_format
+        template = str(value("template", project.template))
+        if template in DESIGN_TEMPLATES:
+            project.template = template
+        background = str(value("background_color", project.background_color))
+        if background.startswith("#"):
+            project.background_color = background
+        project.cut_marks = self._as_setting_bool(
+            value("cut_marks", project.cut_marks), project.cut_marks)
+        project.safe_margin_mm = self._as_setting_float(
+            value("safe_margin_mm", project.safe_margin_mm),
+            project.safe_margin_mm)
+        project.show_safe_area = self._as_setting_bool(
+            value("show_safe_area", project.show_safe_area),
+            project.show_safe_area)
+        project.snap_enabled = self._as_setting_bool(
+            value("snap_enabled", project.snap_enabled), project.snap_enabled)
+        project.clamp_settings()
+        if project.items:
+            project.set_layout(len(project.items), landscape=project.landscape)
 
     # -------------------------------------------------------- недавние проекты
     def _recent_project_paths(self) -> list[str]:
@@ -397,6 +517,9 @@ class MainWindow(QMainWindow):
             self.act_preflight, self.act_batch,
         ])
         menu.addSeparator()
+        menu.addActions([
+            self.act_search_panel, self.act_previous_card, self.act_next_card])
+        menu.addSeparator()
         menu.addAction(self.act_about)
         menu.addSeparator()
         menu.addAction(self.act_quit)
@@ -411,17 +534,13 @@ class MainWindow(QMainWindow):
         label.setProperty("role", "field")
         return label
 
-    @staticmethod
-    def _card(title: str) -> tuple[QFrame, QVBoxLayout]:
-        frame = QFrame()
-        frame.setProperty("card", True)
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(16, 14, 16, 16)
-        layout.setSpacing(10)
-        heading = QLabel(title)
-        heading.setProperty("role", "section")
-        layout.addWidget(heading)
-        return frame, layout
+    def _card(self, title: str, *, key: str | None = None,
+              expanded: bool = True) -> tuple[CollapsibleCard, QVBoxLayout]:
+        card = CollapsibleCard(
+            title, key=key, settings=self._settings, expanded=expanded)
+        if key:
+            self._section_cards[key] = card
+        return card, card.content_layout
 
     @staticmethod
     def _segment_button(text: str) -> QPushButton:
@@ -507,6 +626,499 @@ class MainWindow(QMainWindow):
         layout.addLayout(row)
         self._adjustment_controls[field_name] = (slider, spin, scale)
 
+    # ----------------------------------------- визуальные выборы и навигация
+    @staticmethod
+    def _select_combo_data(combo: QComboBox, data: object) -> None:
+        index = combo.findData(data)
+        if index >= 0 and index != combo.currentIndex():
+            combo.setCurrentIndex(index)
+
+    @staticmethod
+    def _pil_icon(image: PilImage.Image) -> QIcon:
+        rgb = image.convert("RGB")
+        qimage = QImage(
+            rgb.tobytes(), rgb.width, rgb.height, rgb.width * 3,
+            QImage.Format.Format_RGB888).copy()
+        return QIcon(QPixmap.fromImage(qimage))
+
+    @staticmethod
+    def _choice_pixmap() -> QPixmap:
+        pixmap = QPixmap(144, 92)
+        pixmap.fill(QColor("#111418"))
+        return pixmap
+
+    def _paper_icon(self, key: str) -> QIcon:
+        pixmap = self._choice_pixmap()
+        if key == "custom":
+            width_cm = self.project.sheet_width_cm
+            height_cm = self.project.sheet_height_cm
+        else:
+            short, long = PAPER_SIZES[key]
+            width_cm, height_cm = (
+                (long, short) if self.project.landscape else (short, long))
+        scale = min(112.0 / width_cm, 66.0 / height_cm)
+        width = max(28.0, width_cm * scale)
+        height = max(22.0, height_cm * scale)
+        x = (144.0 - width) / 2.0
+        y = (92.0 - height) / 2.0
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#536471"), 3))
+        painter.setBrush(QBrush(QColor("#EFF3F4")))
+        painter.drawRoundedRect(QRectF(x, y, width, height), 4, 4)
+        painter.setPen(QPen(QColor("#1D9BF0"), 2))
+        painter.setBrush(QBrush(QColor("#DCEEFF")))
+        card_w = max(12.0, width * 0.28)
+        card_h = max(14.0, height * 0.52)
+        painter.drawRoundedRect(
+            QRectF(x + width * 0.16, y + height * 0.20, card_w, card_h), 3, 3)
+        painter.setBrush(QBrush(QColor("#FFF2CF")))
+        painter.drawRoundedRect(
+            QRectF(x + width * 0.56, y + height * 0.20, card_w, card_h), 3, 3)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _card_format_icon(spec) -> QIcon:
+        pixmap = MainWindow._choice_pixmap()
+        height = 68.0
+        width = height / spec.frame_ratio
+        if width > 112.0:
+            factor = 112.0 / width
+            width *= factor
+            height *= factor
+        x = (144.0 - width) / 2.0
+        y = (92.0 - height) / 2.0
+        photo = QRectF(
+            x + width * spec.photo_x_frac,
+            y + height * spec.photo_y_frac,
+            width * spec.photo_w_frac,
+            height * spec.photo_h_frac)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#536471"), 3))
+        painter.setBrush(QBrush(QColor("#FCFCFA")))
+        painter.drawRoundedRect(QRectF(x, y, width, height), 4, 4)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor("#7FC8F8")))
+        painter.drawRect(QRectF(
+            photo.x(), photo.y(), photo.width(), photo.height() * 0.60))
+        painter.setBrush(QBrush(QColor("#F6C177")))
+        painter.drawRect(QRectF(
+            photo.x(), photo.y() + photo.height() * 0.60,
+            photo.width(), photo.height() * 0.40))
+        painter.setBrush(QBrush(QColor("#FFF3B0")))
+        sun = min(photo.width(), photo.height()) * 0.22
+        painter.drawEllipse(QRectF(
+            photo.x() + photo.width() * 0.62,
+            photo.y() + photo.height() * 0.12, sun, sun))
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _template_icon(template) -> QIcon:
+        pixmap = QPixmap(144, 92)
+        pixmap.fill(QColor(template.background_color))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#536471"), 2))
+        painter.drawRoundedRect(QRectF(2, 2, 140, 88), 6, 6)
+        positions = [(48.0, 46.0, -7.0), (96.0, 46.0, 6.0)]
+        for index, (cx, cy, angle) in enumerate(positions):
+            frame = template.frame_colors[index % len(template.frame_colors)]
+            painter.save()
+            painter.translate(cx, cy)
+            painter.rotate(angle)
+            painter.setPen(QPen(QColor("#536471"), 2))
+            painter.setBrush(QBrush(QColor(frame)))
+            painter.drawRoundedRect(QRectF(-24, -31, 48, 62), 4, 4)
+            painter.setPen(Qt.PenStyle.NoPen)
+            photo_color = "#6B7280" if template.filter == "bw" else "#7FC8F8"
+            painter.setBrush(QBrush(QColor(photo_color)))
+            painter.drawRect(QRectF(-18, -24, 36, 25))
+            painter.setBrush(QBrush(QColor(
+                "#D1D5DB" if template.filter == "bw" else "#F6C177")))
+            painter.drawRect(QRectF(-18, 1, 36, 12))
+            painter.restore()
+        painter.end()
+        return QIcon(pixmap)
+
+    def _make_paper_choices(self) -> list[ChoiceItem]:
+        labels = {
+            "10x15": "10×15",
+            "13x18": "13×18",
+            "15x21": "15×21",
+            "a5": "A5",
+            "a4": "A4",
+            "custom": "Свой размер",
+        }
+        keys = [*PAPER_SIZES, "custom"]
+        return [
+            ChoiceItem(key, labels[key], self._paper_icon(key),
+                       PAPER_LABELS[key])
+            for key in keys
+        ]
+
+    def _make_card_format_choices(self) -> list[ChoiceItem]:
+        labels = {
+            "classic": "Classic",
+            "instax_mini": "Mini",
+            "instax_square": "Square",
+            "instax_wide": "Wide",
+        }
+        return [
+            ChoiceItem(spec.key, labels.get(spec.key, spec.name),
+                       self._card_format_icon(spec), spec.name)
+            for spec in CARD_FORMATS.values()
+        ]
+
+    def _make_template_choices(self) -> list[ChoiceItem]:
+        labels = {
+            "classic": "Классика",
+            "warm_film": "Тёплая",
+            "mono_night": "Монохром",
+            "pastel": "Пастель",
+            "bright_album": "Яркий",
+        }
+        return [
+            ChoiceItem(template.key, labels.get(template.key, template.name),
+                       self._template_icon(template), template.name)
+            for template in DESIGN_TEMPLATES.values()
+        ]
+
+    def _filter_sample_image(self) -> PilImage.Image:
+        if self._filter_sample_cache is not None:
+            return self._filter_sample_cache.copy()
+        width, height, horizon = 192, 128, 82
+        image = PilImage.new("RGB", (width, height))
+        pixels = image.load()
+        for yy in range(height):
+            if yy < horizon:
+                t = yy / max(1, horizon - 1)
+                color = (
+                    int(72 + (250 - 72) * t),
+                    int(155 + (205 - 155) * t),
+                    int(235 + (145 - 235) * t),
+                )
+            else:
+                t = (yy - horizon) / max(1, height - horizon - 1)
+                color = (
+                    int(96 + (58 - 96) * t),
+                    int(164 + (118 - 164) * t),
+                    int(84 + (64 - 84) * t),
+                )
+            for xx in range(width):
+                pixels[xx, yy] = color
+        draw = PilDraw.Draw(image)
+        draw.ellipse((132, 14, 166, 48), fill=(255, 238, 150))
+        draw.polygon(
+            [(0, 84), (48, 52), (92, 84), (132, 58), (192, 84), (192, 96),
+             (0, 96)],
+            fill=(88, 126, 145))
+        draw.polygon([(0, 128), (0, 96), (70, 84), (150, 98), (192, 90),
+                      (192, 128)], fill=(74, 145, 82))
+        draw.rectangle((24, 88, 62, 114), fill=(250, 245, 225))
+        draw.polygon([(18, 89), (43, 72), (68, 89)], fill=(176, 72, 62))
+        draw.rectangle((38, 98, 49, 114), fill=(96, 62, 45))
+        self._filter_sample_cache = image
+        return image.copy()
+
+    def _make_filter_choices(
+            self, base: PilImage.Image,
+            item: PolaroidItem | None = None) -> list[ChoiceItem]:
+        work = base.convert("RGB")
+        target_ratio = 1.5
+        ratio = work.width / max(1, work.height)
+        if ratio > target_ratio:
+            crop_w = int(work.height * target_ratio)
+            left = (work.width - crop_w) // 2
+            work = work.crop((left, 0, left + crop_w, work.height))
+        elif ratio < target_ratio:
+            crop_h = int(work.width / target_ratio)
+            top = (work.height - crop_h) // 2
+            work = work.crop((0, top, work.width, top + crop_h))
+        work = work.resize((192, 128), PilImage.Resampling.LANCZOS)
+        intensity = item.filter_intensity if item is not None else 1.0
+        seed = item.effective_grain_seed() if item is not None else 0
+        return [
+            ChoiceItem(
+                key, title,
+                self._pil_icon(apply_filter(
+                    work.copy(), key, seed=seed, intensity=intensity)),
+                f"Фильтр: {title}")
+            for key, title in FILTERS.items()
+        ]
+
+    def _filter_gallery_cache_key(self) -> tuple | None:
+        if not self.project.items:
+            return None
+        index = self._selected_index()
+        item = self.project.items[index]
+        return (
+            index, item.photo_path, tuple(item.photo_size or ()),
+            item.photo_rotation, item.flip_horizontal, item.flip_vertical,
+            round(item.filter_intensity, 4), round(item.brightness, 4),
+            round(item.contrast, 4), round(item.saturation, 4),
+            round(item.sharpness, 4),
+        )
+
+    def _schedule_filter_gallery_refresh(self) -> None:
+        if not hasattr(self, "filter_gallery"):
+            return
+        if self._filter_gallery_cache_key() != self._filter_gallery_key:
+            self._filter_gallery_timer.start()
+
+    def _refresh_filter_gallery(self) -> None:
+        if not hasattr(self, "filter_gallery") or not self.project.items:
+            return
+        item = self._item()
+        base = self.canvas.filter_base_image(self._selected_index())
+        if base is None:
+            base = self._filter_sample_image()
+        self.filter_gallery.set_choices(
+            self._make_filter_choices(base, item), current=item.filter)
+        self._filter_gallery_key = self._filter_gallery_cache_key()
+
+    def _set_all_sections_expanded(self, expanded: bool) -> None:
+        for card in self._section_cards.values():
+            card.set_expanded(expanded)
+
+    def _focus_panel_search(self) -> None:
+        if hasattr(self, "panel_search"):
+            self.activateWindow()
+            self.panel_search.setFocus(Qt.FocusReason.ShortcutFocusReason)
+            self.panel_search.selectAll()
+
+    def _build_search_targets(self) -> None:
+        entries: list[tuple[str, object]] = [
+            ("Размер бумаги — точный список", self.paper_combo),
+            ("Размер бумаги — визуальный выбор", self.paper_gallery),
+            ("Ширина произвольного листа", self.sheet_width_spin),
+            ("Высота произвольного листа", self.sheet_height_spin),
+            ("Формат карточек — точный список", self.card_format_combo),
+            ("Формат карточек — визуальный выбор", self.format_gallery),
+            ("Дизайн-шаблон — точный список", self.template_combo),
+            ("Дизайн-шаблон — визуальный выбор", self.template_gallery),
+            ("Ориентация листа", self.rb_land),
+            ("Количество снимков на листе", self.count_spin),
+            ("Добавить карточку", self.add_card_button),
+            ("Дублировать карточку", self.duplicate_card_button),
+            ("Удалить карточку", self.delete_card_button),
+            ("Уголки обреза", self.cut_marks_button),
+            ("Безопасная область", self.safe_margin_spin),
+            ("Показывать безопасную область", self.show_safe_button),
+            ("Магнитное выравнивание", self.snap_button),
+            ("Фон листа", self.background_button),
+            ("Размер карточки", self.card_size_spin),
+            ("Наклон карточки", self.rot_spin),
+            ("Масштаб фотографии", self.zoom_spin),
+            ("Отражение фотографии", self.flip_h_button),
+            ("Подпись на рамке", self.caption_edit),
+            ("Выравнивание подписи", self.caption_align_combo),
+            ("Цвет подписи", self.caption_color_button),
+            ("Фильтр в стиле плёнки", self.filter_gallery),
+            ("Цвет рамки карточки", self.frame_color_button),
+            ("Загрузить фотографию", self.act_open),
+            ("Проверить макет перед печатью", self.act_preflight),
+            ("Экспорт листа", self.act_export),
+            ("Предпросмотр и печать", self.act_print),
+            ("Пакетная обработка", self.act_batch),
+            ("Новый проект", self.act_new_project),
+            ("Открыть проект", self.act_open_project),
+            ("Сохранить проект", self.act_save_project),
+            ("Предыдущая карточка", self.act_previous_card),
+            ("Следующая карточка", self.act_next_card),
+        ]
+        adjustment_labels = {
+            "filter_intensity": "Сила фильтра",
+            "brightness": "Яркость фотографии",
+            "contrast": "Контраст фотографии",
+            "saturation": "Насыщенность фотографии",
+            "sharpness": "Резкость фотографии",
+            "caption_scale": "Размер подписи",
+        }
+        for field_name, label in adjustment_labels.items():
+            if field_name in self._adjustment_controls:
+                entries.append(
+                    (label, self._adjustment_controls[field_name][1]))
+        self._search_targets = dict(entries)
+
+        if hasattr(self, "panel_search"):
+            model = QStringListModel(list(self._search_targets), self)
+            completer = QCompleter(model, self)
+            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchFlag.MatchContains)
+            completer.setCompletionMode(
+                QCompleter.CompletionMode.PopupCompletion)
+            completer.activated[str].connect(self._activate_search_result)
+            self.panel_search.setCompleter(completer)
+            self._search_completer = completer
+
+    def _show_panel_widget(self, widget: QWidget) -> None:
+        current: QWidget | None = widget
+        while current is not None:
+            if isinstance(current, CollapsibleCard):
+                current.set_expanded(True)
+            current = current.parentWidget()
+
+        def reveal() -> None:
+            if hasattr(self, "panel_scroll"):
+                self.panel_scroll.ensureWidgetVisible(widget, 24, 24)
+            self.activateWindow()
+            widget.setFocus(Qt.FocusReason.OtherFocusReason)
+
+        QTimer.singleShot(0, reveal)
+
+    def _activate_search_result(self, text: str) -> None:
+        query = (text or "").strip()
+        if not query:
+            return
+        target = self._search_targets.get(query)
+        if target is None:
+            folded = query.casefold()
+            target = next(
+                (value for label, value in self._search_targets.items()
+                 if folded in label.casefold()), None)
+        if target is None:
+            self.statusBar().showMessage(
+                f"Настройка не найдена: {query}", 3500)
+            return
+        if isinstance(target, QAction):
+            target.trigger()
+        elif isinstance(target, QWidget):
+            self._show_panel_widget(target)
+        if hasattr(self, "panel_search"):
+            self.panel_search.selectAll()
+
+    @staticmethod
+    def _placeholder_slot_icon(symbol: str = "+") -> QIcon:
+        pixmap = QPixmap(96, 68)
+        pixmap.fill(QColor("#16181C"))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#536471"), 2, Qt.PenStyle.DashLine))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(QRectF(4, 4, 88, 60), 8, 8)
+        painter.setPen(QColor("#71767B"))
+        painter.drawText(
+            pixmap.rect(), Qt.AlignmentFlag.AlignCenter, symbol)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _select_slot(self, index: int) -> None:
+        if not (0 <= index < len(self.project.items)):
+            return
+        card = self._section_cards.get("card")
+        if card is not None:
+            card.set_expanded(True)
+        self.canvas.select(index)
+        self._sync_panel()
+
+    def _select_relative_card(self, delta: int) -> None:
+        count = len(self.project.items)
+        if count <= 1:
+            return
+        self._select_slot((self._selected_index() + delta) % count)
+
+    def _refresh_slot_strip(self) -> None:
+        if not hasattr(self, "_slot_strip_layout"):
+            return
+        count = len(self.project.items)
+        if len(self._slot_buttons) != count:
+            while self._slot_strip_layout.count():
+                layout_item = self._slot_strip_layout.takeAt(0)
+                widget = layout_item.widget()
+                if widget is not None:
+                    widget.setParent(None)
+                    widget.deleteLater()
+            self._slot_buttons.clear()
+            self._slot_icon_keys.clear()
+            for index in range(count):
+                button = QToolButton()
+                button.setProperty("slotButton", True)
+                button.setCheckable(True)
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+                button.setFixedSize(68, 64)
+                button.setIconSize(QSize(48, 34))
+                button.setToolButtonStyle(
+                    Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+                button.setAccessibleName(f"Карточка {index + 1}")
+                button.clicked.connect(
+                    lambda _checked=False, i=index: self._select_slot(i))
+                self._slot_strip_layout.addWidget(button)
+                self._slot_buttons.append(button)
+            self._slot_strip_layout.addStretch(1)
+
+        selected = self._selected_index()
+        for index, (item, button) in enumerate(
+                zip(self.project.items, self._slot_buttons)):
+            pixmap = self.canvas.preview_pixmap(index)
+            has_preview = pixmap is not None and not pixmap.isNull()
+            exists = bool(item.photo_path and os.path.isfile(item.photo_path))
+            dpi = item.effective_print_dpi() if item.photo_path else None
+            if not item.photo_path:
+                state, suffix = "empty", "+"
+                detail = "без фотографии"
+            elif not exists:
+                state, suffix = "error", "!"
+                detail = "файл фотографии не найден"
+            elif not has_preview:
+                state, suffix = "error", "!"
+                detail = "не удалось загрузить фотографию"
+            elif dpi is not None and dpi < 300:
+                state, suffix = "warning", f"⚠ {dpi:.0f}"
+                detail = f"эффективный DPI: {dpi:.0f}"
+            elif dpi is not None:
+                state, suffix = "ok", "✓"
+                detail = f"эффективный DPI: {dpi:.0f}"
+            else:
+                state, suffix = "ok", "✓"
+                detail = "фотография загружена"
+
+            text = f"{index + 1} · {suffix}"
+            if button.text() != text:
+                button.setText(text)
+            if button.property("slotState") != state:
+                button.setProperty("slotState", state)
+                button.style().unpolish(button)
+                button.style().polish(button)
+            blocked = button.blockSignals(True)
+            try:
+                button.setChecked(index == selected)
+            finally:
+                button.blockSignals(blocked)
+
+            name = os.path.basename(item.photo_path) if item.photo_path else ""
+            button.setToolTip(
+                f"Карточка {index + 1}: {detail}"
+                + (f"\n{name}" if name else ""))
+            icon_key = (
+                state, item.photo_path, tuple(item.photo_size or ()),
+                item.filter, item.filter_intensity, item.brightness,
+                item.contrast, item.saturation, item.sharpness,
+                item.photo_rotation, item.flip_horizontal,
+                item.flip_vertical,
+            )
+            if self._slot_icon_keys.get(index) != icon_key:
+                if has_preview:
+                    scaled = pixmap.scaled(
+                        QSize(96, 68),
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation)
+                    left = max(0, (scaled.width() - 96) // 2)
+                    top = max(0, (scaled.height() - 68) // 2)
+                    button.setIcon(QIcon(scaled.copy(left, top, 96, 68)))
+                else:
+                    button.setIcon(self._placeholder_slot_icon(
+                        "!" if state == "error" else "+"))
+                self._slot_icon_keys[index] = icon_key
+
+        if 0 <= selected < len(self._slot_buttons):
+            self.slot_scroll.ensureWidgetVisible(
+                self._slot_buttons[selected], 10, 0)
+
     def _build_panel(self) -> QWidget:
         inner = QWidget()
         lay = QVBoxLayout(inner)
@@ -514,7 +1126,8 @@ class MainWindow(QMainWindow):
         lay.setSpacing(14)
 
         # --- Лист ---
-        sheet_card, gl = self._card("Лист и форматы")
+        sheet_card, gl = self._card(
+            "Лист и форматы", key="sheet", expanded=True)
         gl.addWidget(self._field_label("Размер бумаги"))
         self.paper_combo = QComboBox()
         self.paper_combo.setMinimumHeight(38)
@@ -527,6 +1140,12 @@ class MainWindow(QMainWindow):
         self.paper_combo.currentIndexChanged.connect(
             lambda _idx: self._paper_changed())
         gl.addWidget(self.paper_combo)
+        self.paper_gallery = VisualChoiceStrip()
+        self.paper_gallery.set_choices(
+            self._make_paper_choices(), current=self.project.paper_size)
+        self.paper_gallery.selected.connect(
+            lambda key: self._select_combo_data(self.paper_combo, key))
+        gl.addWidget(self.paper_gallery)
 
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -566,6 +1185,12 @@ class MainWindow(QMainWindow):
         self.card_format_combo.currentIndexChanged.connect(
             lambda _idx: self._card_format_changed())
         gl.addWidget(self.card_format_combo)
+        self.format_gallery = VisualChoiceStrip()
+        self.format_gallery.set_choices(
+            self._make_card_format_choices(), current=self.project.card_format)
+        self.format_gallery.selected.connect(
+            lambda key: self._select_combo_data(self.card_format_combo, key))
+        gl.addWidget(self.format_gallery)
 
         gl.addWidget(self._field_label("Дизайн-шаблон"))
         self.template_combo = QComboBox()
@@ -576,6 +1201,12 @@ class MainWindow(QMainWindow):
         if template_idx >= 0:
             self.template_combo.setCurrentIndex(template_idx)
         gl.addWidget(self.template_combo)
+        self.template_gallery = VisualChoiceStrip()
+        self.template_gallery.set_choices(
+            self._make_template_choices(), current=self.project.template)
+        self.template_gallery.selected.connect(
+            lambda key: self._select_combo_data(self.template_combo, key))
+        gl.addWidget(self.template_gallery)
         btn_template = self._ghost_button("Применить шаблон ко всему листу", 34)
         btn_template.clicked.connect(self._apply_template)
         gl.addWidget(btn_template)
@@ -688,7 +1319,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(sheet_card)
 
         # --- Выбранный полароид ---
-        item_card, il = self._card("Полароид")
+        item_card, il = self._card(
+            "Карточка и фото", key="card", expanded=True)
         row = QHBoxLayout()
         row.setSpacing(8)
         self.slot_label = QLabel("Слот 1 / 1")
@@ -830,6 +1462,10 @@ class MainWindow(QMainWindow):
         self.photo_transform_label.setProperty("role", "muted")
         il.addWidget(self.photo_transform_label)
 
+        lay.addWidget(item_card)
+
+        caption_card, il = self._card(
+            "Подпись", key="caption", expanded=False)
         il.addWidget(self._field_label("Подпись на рамке"))
         self.caption_edit = QPlainTextEdit()
         self.caption_edit.setPlaceholderText("лето 2026")
@@ -865,6 +1501,10 @@ class MainWindow(QMainWindow):
             lambda: self._set_item(caption_color=None, refresh_pixmap=False))
         il.addWidget(btn_caption_auto)
 
+        lay.addWidget(caption_card)
+
+        style_card, il = self._card(
+            "Фильтр и цвета", key="style", expanded=False)
         il.addWidget(self._field_label("Фильтр в стиле плёнки"))
         self.filter_combo = QComboBox()
         self.filter_combo.setMinimumHeight(40)
@@ -874,6 +1514,16 @@ class MainWindow(QMainWindow):
         self.filter_combo.currentIndexChanged.connect(
             lambda: self._set_item(filter=self.filter_combo.currentData()))
         il.addWidget(self.filter_combo)
+        self.filter_gallery = VisualChoiceStrip()
+        initial_item = self._item()
+        self.filter_gallery.set_choices(
+            self._make_filter_choices(
+                self._filter_sample_image(), initial_item),
+            current=initial_item.filter)
+        self._filter_gallery_key = self._filter_gallery_cache_key()
+        self.filter_gallery.selected.connect(
+            lambda key: self._set_item(filter=key))
+        il.addWidget(self.filter_gallery)
         self._make_adjustment_row(
             il, "Сила фильтра", "filter_intensity", 0.0, 1.0)
         self._make_adjustment_row(il, "Яркость", "brightness", 0.4, 1.8)
@@ -900,10 +1550,11 @@ class MainWindow(QMainWindow):
         btn_paste_style.clicked.connect(self._paste_card_style)
         row.addWidget(btn_paste_style, 1)
         il.addLayout(row)
-        lay.addWidget(item_card)
+        lay.addWidget(style_card)
 
         # --- Готово ---
-        out_card, ol = self._card("Готовый лист")
+        out_card, ol = self._card(
+            "Готовый лист", key="output", expanded=True)
         self.size_label = QLabel()
         self.size_label.setProperty("role", "muted")
         self.size_label.setWordWrap(True)
@@ -931,7 +1582,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(out_card)
 
         # --- Подсказки ---
-        hint_card, hl = self._card("Управление на холсте")
+        hint_card, hl = self._card(
+            "Управление на холсте", key="hints", expanded=False)
         hint = QLabel(
             "Колесо — масштаб фото\n"
             "Shift + колесо — наклон\n"
@@ -944,6 +1596,10 @@ class MainWindow(QMainWindow):
             "Правый клик — действия с карточкой\n"
             "Ctrl+V на холсте — фото из буфера обмена\n"
             "Двойной клик — загрузить фото\n"
+            "Лента карточек сверху — быстрый переход между слотами\n"
+            "Ctrl+Tab / Ctrl+Shift+Tab — соседние карточки\n"
+            "PageUp / PageDown на холсте — соседние карточки\n"
+            "Ctrl+K — найти настройку или действие\n"
             "Стрелки — точный сдвиг фото\n"
             "Delete — удалить карточку, Ctrl+D — дублировать\n\n"
             "Можно выбрать или перетащить сразу несколько фото — "
@@ -961,7 +1617,98 @@ class MainWindow(QMainWindow):
         scroll.setFixedWidth(404)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        return scroll
+        self.panel_scroll = scroll
+
+        panel = QFrame()
+        panel.setObjectName("inspectorPanel")
+        panel.setFixedWidth(404)
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        header = QWidget()
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(12, 12, 12, 10)
+        header_layout.setSpacing(8)
+
+        search_row = QHBoxLayout()
+        search_row.setSpacing(8)
+        self.panel_search = QLineEdit()
+        self.panel_search.setPlaceholderText(
+            "Найти настройку или действие… (Ctrl+K)")
+        self.panel_search.setClearButtonEnabled(True)
+        self.panel_search.setMinimumHeight(38)
+        self.panel_search.setAccessibleName("Поиск по настройкам и действиям")
+        self.panel_search.returnPressed.connect(
+            lambda: self._activate_search_result(self.panel_search.text()))
+        search_row.addWidget(self.panel_search, 1)
+        expand_all = QToolButton()
+        expand_all.setObjectName("iconButton")
+        expand_all.setText("+")
+        expand_all.setFixedSize(36, 38)
+        expand_all.setToolTip("Развернуть все разделы")
+        expand_all.setAccessibleName("Развернуть все разделы")
+        expand_all.clicked.connect(
+            lambda: self._set_all_sections_expanded(True))
+        search_row.addWidget(expand_all)
+        collapse_all = QToolButton()
+        collapse_all.setObjectName("iconButton")
+        collapse_all.setText("-")
+        collapse_all.setFixedSize(36, 38)
+        collapse_all.setToolTip("Свернуть все разделы")
+        collapse_all.setAccessibleName("Свернуть все разделы")
+        collapse_all.clicked.connect(
+            lambda: self._set_all_sections_expanded(False))
+        search_row.addWidget(collapse_all)
+        header_layout.addLayout(search_row)
+
+        slot_title_row = QHBoxLayout()
+        slot_title_row.setSpacing(8)
+        slot_title = QLabel("Карточки")
+        slot_title.setProperty("role", "section")
+        slot_title_row.addWidget(slot_title)
+        slot_title_row.addStretch(1)
+        self.previous_slot_button = QToolButton()
+        self.previous_slot_button.setObjectName("iconButton")
+        self.previous_slot_button.setText("<")
+        self.previous_slot_button.setFixedSize(34, 32)
+        self.previous_slot_button.setToolTip("Предыдущая карточка (Ctrl+Shift+Tab)")
+        self.previous_slot_button.setAccessibleName("Предыдущая карточка")
+        self.previous_slot_button.clicked.connect(
+            lambda: self._select_relative_card(-1))
+        slot_title_row.addWidget(self.previous_slot_button)
+        self.next_slot_button = QToolButton()
+        self.next_slot_button.setObjectName("iconButton")
+        self.next_slot_button.setText(">")
+        self.next_slot_button.setFixedSize(34, 32)
+        self.next_slot_button.setToolTip("Следующая карточка (Ctrl+Tab)")
+        self.next_slot_button.setAccessibleName("Следующая карточка")
+        self.next_slot_button.clicked.connect(
+            lambda: self._select_relative_card(1))
+        slot_title_row.addWidget(self.next_slot_button)
+        header_layout.addLayout(slot_title_row)
+
+        self.slot_scroll = QScrollArea()
+        self.slot_scroll.setObjectName("slotStrip")
+        self.slot_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.slot_scroll.setWidgetResizable(True)
+        self.slot_scroll.setFixedHeight(78)
+        self.slot_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.slot_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._slot_strip_content = QWidget()
+        self._slot_strip_layout = QHBoxLayout(self._slot_strip_content)
+        self._slot_strip_layout.setContentsMargins(2, 4, 2, 4)
+        self._slot_strip_layout.setSpacing(7)
+        self.slot_scroll.setWidget(self._slot_strip_content)
+        header_layout.addWidget(self.slot_scroll)
+
+        outer.addWidget(header)
+        outer.addWidget(scroll, 1)
+        self._build_search_targets()
+        self._refresh_slot_strip()
+        return panel
 
     # ------------------------------------------------------------- помощники
     def _selected_index(self) -> int:
@@ -994,6 +1741,7 @@ class MainWindow(QMainWindow):
         self._sync_layout_controls()
         self._sync_panel()
         self._commit_change(before)
+        self._remember_project_defaults()
 
     # -------------------------------------------- состояние, история, автосейв
     def _snapshot_state(self) -> tuple[Project, int]:
@@ -1130,6 +1878,24 @@ class MainWindow(QMainWindow):
             for preset, button in self.count_buttons.items():
                 button.setChecked(preset == count)
             self.cut_marks_button.setChecked(self.project.cut_marks)
+            if hasattr(self, "paper_gallery"):
+                paper_key = (
+                    self.project.landscape,
+                    (self.project.sheet_width_cm,
+                     self.project.sheet_height_cm)
+                    if self.project.paper_size == "custom" else None,
+                )
+                if getattr(self, "_paper_gallery_state", None) != paper_key:
+                    self.paper_gallery.set_choices(
+                        self._make_paper_choices(),
+                        current=self.project.paper_size)
+                    self._paper_gallery_state = paper_key
+                else:
+                    self.paper_gallery.set_current(self.project.paper_size)
+            if hasattr(self, "format_gallery"):
+                self.format_gallery.set_current(self.project.card_format)
+            if hasattr(self, "template_gallery"):
+                self.template_gallery.set_current(self.project.template)
         finally:
             for control, blocked in zip(controls, blockers):
                 control.blockSignals(blocked)
@@ -1141,6 +1907,7 @@ class MainWindow(QMainWindow):
         self._style_color_button(
             self.background_button, self.project.background_color,
             f"Фон: {self.project.background_color.upper()}")
+        self._refresh_slot_strip()
 
     def _apply_state(self, state: tuple[Project, int]) -> None:
         project, selected = state
@@ -1293,6 +2060,7 @@ class MainWindow(QMainWindow):
             return
         project = Project()
         project.set_layout(1, landscape=True)
+        self._apply_saved_project_defaults(project)
         self._replace_project(project, 0)
         self._cleanup_project_tempdir()
         self._project_path = None
@@ -1513,6 +2281,10 @@ class MainWindow(QMainWindow):
             else "Подпись: автоматически")
         self._style_color_button(
             self.caption_color_button, caption_hex, caption_text)
+        if hasattr(self, "filter_gallery"):
+            self.filter_gallery.set_current(item.filter)
+            self._schedule_filter_gallery_refresh()
+        self._refresh_slot_strip()
 
     # ------------------------------------------------------------- действия
     def _orientation_changed(self, _checked: bool) -> None:
@@ -1523,6 +2295,7 @@ class MainWindow(QMainWindow):
         self._sync_layout_controls()
         self._sync_panel()
         self._commit_change(before)
+        self._remember_project_defaults()
 
     def _count_changed(self, count: int) -> None:
         before = self._snapshot_state()
@@ -1550,6 +2323,7 @@ class MainWindow(QMainWindow):
         self._sync_layout_controls()
         self._sync_panel()
         self._commit_change(before)
+        self._remember_project_defaults()
 
     def _custom_sheet_changed(self) -> None:
         if str(self.paper_combo.currentData() or "") != "custom":
@@ -1568,6 +2342,7 @@ class MainWindow(QMainWindow):
         self._sync_layout_controls()
         self._sync_panel()
         self._commit_change(before)
+        self._remember_project_defaults()
 
     def _card_format_changed(self) -> None:
         card_format = str(self.card_format_combo.currentData() or "classic")
@@ -1579,6 +2354,7 @@ class MainWindow(QMainWindow):
         self._sync_layout_controls()
         self._sync_panel()
         self._commit_change(before)
+        self._remember_project_defaults()
 
     def _apply_template(self) -> None:
         template_key = str(self.template_combo.currentData() or "classic")
@@ -1588,6 +2364,7 @@ class MainWindow(QMainWindow):
         self._sync_layout_controls()
         self._sync_panel()
         self._commit_change(before)
+        self._remember_project_defaults()
         self.statusBar().showMessage(
             f"Применён шаблон «{template.name}»", 3500)
 
