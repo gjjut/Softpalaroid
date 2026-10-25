@@ -8,7 +8,7 @@
 - перетаскивание белой рамки       — перемещение карточки по листу
 - Alt + перетаскивание / ручка ⤾   — наклон карточки
 - двойной клик по карточке         — загрузить фото
-- Delete / Ctrl+D                  — удалить / дублировать карточку
+- Delete / Ctrl+D / Ctrl+V         — удалить / дублировать / вставить фото
 - перетаскивание пустого места     — прокрутка просмотра (когда увеличено)
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 from enum import Enum, auto
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -33,11 +33,10 @@ from PySide6.QtGui import (
 from PIL import UnidentifiedImageError
 from PySide6.QtWidgets import QWidget
 
-from .filters import apply_filter, transform_photo
+from .filters import apply_filter, apply_photo_adjustments, transform_photo
 from .image_io import load_photo
 from .model import (
     CUT_MARK_WIDTH_PX,
-    PHOTO_INSET_FRAC,
     PolaroidItem,
     Project,
     cut_mark_rgb,
@@ -63,6 +62,7 @@ class _DragMode(Enum):
     NONE = auto()
     PAN_PHOTO = auto()
     MOVE_ITEM = auto()
+    RESIZE_ITEM = auto()
     ROTATE = auto()
     PAN_VIEW = auto()
 
@@ -73,6 +73,8 @@ class CanvasWidget(QWidget):
     photoLoadRequested = Signal(int)
     deleteRequested = Signal(int)
     duplicateRequested = Signal(int)
+    pasteRequested = Signal(int)
+    contextMenuRequested = Signal(int, QPoint)
     editStarted = Signal()
     editFinished = Signal()
 
@@ -99,7 +101,11 @@ class CanvasWidget(QWidget):
         self._start_angle = 0.0
         self._start_rotation = 0.0
         self._start_pan = QPointF()
-        self._handle_sheet = QPointF()  # позиция ручки наклона (координаты листа)
+        self._handle_sheet = QPointF()  # ручка наклона, координаты листа
+        self._resize_handle_sheet = QPointF()  # ручка размера, координаты листа
+        self._start_width = 0.0
+        self._start_local_vector = QPointF()
+        self._snap_guides: list[tuple[str, float]] = []
 
     # ------------------------------------------------------------------ API
     def set_project(self, project: Project) -> None:
@@ -133,7 +139,7 @@ class CanvasWidget(QWidget):
             return
         try:
             img = load_photo(item.photo_path)
-        except (OSError, UnidentifiedImageError):
+        except Exception:  # noqa: BLE001 - битый/пропавший файл = пустой слот
             self._pixmaps.pop(index, None)
             self.update()
             return
@@ -145,7 +151,18 @@ class CanvasWidget(QWidget):
             flip_horizontal=item.flip_horizontal,
             flip_vertical=item.flip_vertical,
         )
-        img = apply_filter(img, item.filter)
+        img = apply_photo_adjustments(
+            img,
+            brightness=item.brightness,
+            contrast=item.contrast,
+            saturation=item.saturation,
+            sharpness=item.sharpness,
+        )
+        img = apply_filter(
+            img, item.filter,
+            seed=item.effective_grain_seed(),
+            intensity=item.filter_intensity,
+        )
         qimg = QImage(
             img.tobytes(), img.width, img.height, img.width * 3,
             QImage.Format.Format_RGB888,
@@ -226,15 +243,89 @@ class CanvasWidget(QWidget):
 
     def _in_photo(self, item: PolaroidItem, sheet_pt: QPointF) -> bool:
         loc = self._local(item, sheet_pt)
-        px, py, s, _ = item.photo_rect_local()
-        return px <= loc.x() <= px + s and py <= loc.y() <= py + s
+        px, py, pw, ph = item.photo_rect_local()
+        return px <= loc.x() <= px + pw and py <= loc.y() <= py + ph
+
+    @staticmethod
+    def _local_vector(item: PolaroidItem, sheet_pt: QPointF) -> QPointF:
+        """Вектор от центра карточки в её локальных осях."""
+        dx = sheet_pt.x() - item.center_x
+        dy = sheet_pt.y() - item.center_y
+        a = math.radians(item.rotation)
+        return QPointF(
+            dx * math.cos(a) + dy * math.sin(a),
+            -dx * math.sin(a) + dy * math.cos(a),
+        )
+
+    @staticmethod
+    def _distance(a: QPointF, b: QPointF) -> float:
+        d = a - b
+        return (d.x() ** 2 + d.y() ** 2) ** 0.5
 
     def _hit_handle(self, widget_pos: QPointF) -> bool:
         if self.project is None or not self.project.items:
             return False
-        hw = self._to_widget(self._handle_sheet)
-        d = widget_pos - hw
-        return (d.x() ** 2 + d.y() ** 2) ** 0.5 <= 14
+        return self._distance(widget_pos, self._to_widget(self._handle_sheet)) <= 14
+
+    def _hit_resize_handle(self, widget_pos: QPointF) -> bool:
+        if self.project is None or not self.project.items:
+            return False
+        return self._distance(
+            widget_pos, self._to_widget(self._resize_handle_sheet)) <= 14
+
+    def _snap_center(self, item: PolaroidItem, proposed: QPointF,
+                     modifiers=Qt.KeyboardModifier.NoModifier) -> QPointF:
+        """Магнит центра/краёв карточки к листу, безопасной зоне и соседям."""
+        self._snap_guides = []
+        if self.project is None or not self.project.snap_enabled:
+            return proposed
+        if modifiers & Qt.KeyboardModifier.AltModifier:
+            return proposed
+        threshold = 10.0 / max(0.01, self._scale())
+        corners = item.corners_sheet()
+        rel_x = [x - item.center_x for x, _y in corners]
+        rel_y = [y - item.center_y for _x, y in corners]
+        own_x = (proposed.x() + min(rel_x), proposed.x(),
+                 proposed.x() + max(rel_x))
+        own_y = (proposed.y() + min(rel_y), proposed.y(),
+                 proposed.y() + max(rel_y))
+
+        targets_x = [0.0, self.project.sheet_w / 2.0,
+                     float(self.project.sheet_w)]
+        targets_y = [0.0, self.project.sheet_h / 2.0,
+                     float(self.project.sheet_h)]
+        if self.project.safe_margin_mm > 0:
+            left, top, right, bottom = self.project.safe_rect_px()
+            targets_x.extend([left, right])
+            targets_y.extend([top, bottom])
+        for other in self.project.items:
+            if other is item:
+                continue
+            left, top, right, bottom = other.bounds_sheet()
+            targets_x.extend([left, (left + right) / 2.0, right])
+            targets_y.extend([top, (top + bottom) / 2.0, bottom])
+
+        def best(own: tuple[float, float, float],
+                 targets: list[float]) -> tuple[float, float] | None:
+            result: tuple[float, float] | None = None
+            for anchor in own:
+                for target in targets:
+                    delta = target - anchor
+                    if abs(delta) <= threshold and (
+                            result is None or abs(delta) < abs(result[0])):
+                        result = (delta, target)
+            return result
+
+        dx = best(own_x, targets_x)
+        dy = best(own_y, targets_y)
+        snapped = QPointF(proposed)
+        if dx is not None:
+            snapped.setX(snapped.x() + dx[0])
+            self._snap_guides.append(("v", dx[1]))
+        if dy is not None:
+            snapped.setY(snapped.y() + dy[0])
+            self._snap_guides.append(("h", dy[1]))
+        return snapped
 
     # ------------------------------------------------------------ рисование
     def paintEvent(self, _event) -> None:  # noqa: N802
@@ -268,8 +359,99 @@ class CanvasWidget(QWidget):
         for i, item in enumerate(self.project.items):
             self._paint_item(p, item, self._pixmaps.get(i), origin, scale)
 
+        self._paint_safe_area(p, origin, scale)
+        self._paint_dpi_badges(p)
+        self._paint_snap_guides(p, origin, scale)
         if self.project.items:
-            self._paint_selection(p, self.project.items[self.selected], origin, scale)
+            selected = max(0, min(self.selected, len(self.project.items) - 1))
+            self._paint_selection(p, self.project.items[selected], origin, scale)
+
+    def _paint_safe_area(self, p: QPainter,
+                         origin: QPointF, scale: float) -> None:
+        if self.project is None or not self.project.show_safe_area:
+            return
+        if self.project.safe_margin_mm <= 0:
+            return
+        left, top, right, bottom = self.project.safe_rect_px()
+        rect = QRectF(
+            origin.x() + left * scale, origin.y() + top * scale,
+            (right - left) * scale, (bottom - top) * scale)
+        accent = QColor("#1D9BF0")
+        p.save()
+        # Лёгкая вуаль снаружи безопасной зоны не меняет финальный рендер:
+        # это только редакторская подсказка.
+        sheet = QRectF(origin.x(), origin.y(),
+                       self.project.sheet_w * scale,
+                       self.project.sheet_h * scale)
+        veil = QPainterPath()
+        veil.setFillRule(Qt.FillRule.OddEvenFill)
+        veil.addRect(sheet)
+        veil.addRect(rect)
+        p.fillPath(veil, QBrush(QColor(29, 155, 240, 18)))
+        pen = QPen(accent, 1.4)
+        pen.setDashPattern([6, 4])
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(rect)
+        font = QFont()
+        font.setPixelSize(10)
+        font.setWeight(QFont.Weight.DemiBold)
+        p.setFont(font)
+        label_rect = QRectF(rect.left() + 5, rect.top() + 4, 190, 18)
+        p.fillRect(label_rect, QColor(0, 0, 0, 115))
+        p.setPen(QColor("#ffffff"))
+        p.drawText(label_rect.adjusted(5, 0, 0, 0),
+                   Qt.AlignmentFlag.AlignVCenter,
+                   f"безопасная область · {self.project.safe_margin_mm:g} мм")
+        p.restore()
+
+    def _paint_dpi_badges(self, p: QPainter) -> None:
+        if self.project is None:
+            return
+        p.save()
+        font = QFont()
+        font.setPixelSize(11)
+        font.setWeight(QFont.Weight.Bold)
+        metrics = QFontMetricsF(font)
+        p.setFont(font)
+        for item in self.project.items:
+            if not item.photo_path:
+                continue
+            dpi = item.effective_print_dpi()
+            if dpi is None or dpi >= 300.0:
+                continue
+            text = f"{dpi:.0f} DPI"
+            pos = self._to_widget(QPointF(*item.local_to_sheet(8.0, 8.0)))
+            width = metrics.horizontalAdvance(text) + 14
+            rect = QRectF(pos.x() + 6, pos.y() + 6, width, 21)
+            critical = dpi < 180.0
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor("#E0245E" if critical else "#F7B928")))
+            p.drawRoundedRect(rect, 6, 6)
+            p.setPen(QColor("#ffffff" if critical else "#1c1c1c"))
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+        p.restore()
+
+    def _paint_snap_guides(self, p: QPainter,
+                           origin: QPointF, scale: float) -> None:
+        if self.project is None or not self._snap_guides:
+            return
+        p.save()
+        pen = QPen(QColor("#F91880"), 1.4)
+        pen.setDashPattern([7, 4])
+        p.setPen(pen)
+        top = origin.y()
+        bottom = origin.y() + self.project.sheet_h * scale
+        left = origin.x()
+        right = origin.x() + self.project.sheet_w * scale
+        for orientation, coord in self._snap_guides:
+            if orientation == "v":
+                x = origin.x() + coord * scale
+                p.drawLine(QPointF(x, top), QPointF(x, bottom))
+            else:
+                y = origin.y() + coord * scale
+                p.drawLine(QPointF(left, y), QPointF(right, y))
+        p.restore()
 
     def _paint_cut_marks(self, p: QPainter,
                          origin: QPointF, scale: float) -> None:
@@ -308,8 +490,8 @@ class CanvasWidget(QWidget):
         p.setPen(QPen(QColor(*item.contrast_rgb, 42), max(0.8, 1.1 / scale)))
         p.drawPath(frame)
 
-        px, py, s, _ = item.photo_rect_local()
-        photo_rect = QRectF(px, py, s, s)
+        px, py, pw, ph = item.photo_rect_local()
+        photo_rect = QRectF(px, py, pw, ph)
         if pixmap is not None:
             disp = item.displayed_photo_size()
             tl = item.photo_top_left_local()
@@ -332,16 +514,33 @@ class CanvasWidget(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(photo_rect)
 
-        if item.caption.strip():
-            area = QRectF(0, py + s, w, h - (py + s))
-            size = int(area.height() * 0.52)
+        caption = item.caption.strip()
+        if caption.strip():
+            area = QRectF(0, py + ph, w, h - (py + ph))
+            lines = max(1, len(caption.splitlines()))
+            divisor = 1.0 + 0.24 * (lines - 1)
+            size = max(9, int(area.height() * 0.52 * item.caption_scale / divisor))
+            horizontal = {
+                "left": Qt.AlignmentFlag.AlignLeft,
+                "center": Qt.AlignmentFlag.AlignHCenter,
+                "right": Qt.AlignmentFlag.AlignRight,
+            }.get(item.caption_align, Qt.AlignmentFlag.AlignHCenter)
+            flags = (horizontal | Qt.AlignmentFlag.AlignVCenter
+                     | Qt.TextFlag.TextWordWrap)
             font = _caption_qfont(size)
-            while size > 9 and QFontMetricsF(font).horizontalAdvance(item.caption) > w * 0.88:
-                size = int(size * 0.9)
+            while size > 9:
+                bounds = QFontMetricsF(font).boundingRect(
+                    area, int(flags), caption)
+                if bounds.width() <= area.width() * 0.88 and \
+                        bounds.height() <= area.height() * 0.92:
+                    break
+                size = max(9, int(size * 0.9))
                 font = _caption_qfont(size)
             p.setFont(font)
             p.setPen(QColor(*item.caption_rgb))
-            p.drawText(area, Qt.AlignmentFlag.AlignCenter, item.caption)
+            p.drawText(
+                area.adjusted(w * 0.06, 0, -w * 0.06, 0),
+                int(flags), caption)
 
         p.restore()
 
@@ -374,7 +573,23 @@ class CanvasWidget(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(local_handle, r * 0.45, r * 0.45)
 
-        # Запомнить позицию ручки в координатах листа для хит-теста
+        # Квадратная ручка размера в правом нижнем углу.
+        local_resize = QPointF(w + m, h + m)
+        rr = 8.0 / scale
+        p.setPen(QPen(accent, 1.6 / scale))
+        p.setBrush(QBrush(QColor("#ffffff")))
+        p.drawRoundedRect(
+            QRectF(local_resize.x() - rr, local_resize.y() - rr,
+                   rr * 2, rr * 2),
+            2.0 / scale, 2.0 / scale)
+        p.setPen(QPen(accent, 1.4 / scale))
+        p.drawLine(
+            QPointF(local_resize.x() - rr * 0.45, local_resize.y() + rr * 0.45),
+            QPointF(local_resize.x() + rr * 0.45, local_resize.y() - rr * 0.45))
+        resize_sheet = item.local_to_sheet(local_resize.x(), local_resize.y())
+        self._resize_handle_sheet = QPointF(*resize_sheet)
+
+        # Запомнить позицию ручки наклона в координатах листа для хит-теста
         a = math.radians(item.rotation)
         dx, dy = 0.0, -handle_dist
         self._handle_sheet = QPointF(
@@ -391,6 +606,10 @@ class CanvasWidget(QWidget):
         sheet_pt = self._to_sheet(pos)
         self._drag_start_widget = pos
         self._drag_start_sheet = sheet_pt
+
+        if self._hit_resize_handle(pos) and self.project.items:
+            self._begin_resize(self.selected, sheet_pt)
+            return
 
         if self._hit_handle(pos) and self.project.items:
             self._begin_rotate(self.selected, sheet_pt)
@@ -419,6 +638,17 @@ class CanvasWidget(QWidget):
             self._mode = _DragMode.PAN_VIEW
             self._start_pan = QPointF(self._pan)
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _begin_resize(self, idx: int, sheet_pt: QPointF) -> None:
+        if self.project is None or not 0 <= idx < len(self.project.items):
+            return
+        self.editStarted.emit()
+        item = self.project.items[idx]
+        self._mode = _DragMode.RESIZE_ITEM
+        self._drag_index = idx
+        self._start_width = item.width
+        self._start_local_vector = self._local_vector(item, sheet_pt)
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
 
     def _begin_rotate(self, idx: int, sheet_pt: QPointF) -> None:
         self.editStarted.emit()
@@ -449,8 +679,8 @@ class CanvasWidget(QWidget):
         if self._mode is _DragMode.PAN_PHOTO:
             disp = item.displayed_photo_size()
             if disp:
-                s = item.photo_side
-                ox, oy = disp[0] - s, disp[1] - s
+                _px, _py, pw, ph = item.photo_rect_local()
+                ox, oy = disp[0] - pw, disp[1] - ph
                 # Тащим в локальной (повёрнутой) системе карточки
                 start_loc = self._local(item, self._drag_start_sheet)
                 loc = self._local(item, sheet_pt)
@@ -459,10 +689,24 @@ class CanvasWidget(QWidget):
                 if oy > 0:
                     item.offset_y = self._start_offset[1] - (loc.y() - start_loc.y()) / oy
         elif self._mode is _DragMode.MOVE_ITEM:
-            item.center_x = sheet_pt.x() + self._grab_delta.x()
-            item.center_y = sheet_pt.y() + self._grab_delta.y()
-            item.center_x = max(0.0, min(float(self.project.sheet_w), item.center_x))
-            item.center_y = max(0.0, min(float(self.project.sheet_h), item.center_y))
+            proposed = QPointF(
+                sheet_pt.x() + self._grab_delta.x(),
+                sheet_pt.y() + self._grab_delta.y())
+            snapped = self._snap_center(item, proposed, e.modifiers())
+            item.center_x = max(
+                0.0, min(float(self.project.sheet_w), snapped.x()))
+            item.center_y = max(
+                0.0, min(float(self.project.sheet_h), snapped.y()))
+        elif self._mode is _DragMode.RESIZE_ITEM:
+            current = self._local_vector(item, sheet_pt)
+            denominator = (
+                self._start_local_vector.x() ** 2
+                + self._start_local_vector.y() ** 2)
+            if denominator > 1e-9 and self._start_width > 0:
+                factor = (
+                    current.x() * self._start_local_vector.x()
+                    + current.y() * self._start_local_vector.y()) / denominator
+                item.width = self._start_width * max(0.05, factor)
         elif self._mode is _DragMode.ROTATE:
             ang = math.degrees(math.atan2(
                 sheet_pt.y() - item.center_y, sheet_pt.x() - item.center_x))
@@ -476,6 +720,9 @@ class CanvasWidget(QWidget):
         self.update()
 
     def _update_hover_cursor(self, pos: QPointF, sheet_pt: QPointF) -> None:
+        if self._hit_resize_handle(pos):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            return
         if self._hit_handle(pos):
             self.setCursor(Qt.CursorShape.CrossCursor)
             return
@@ -491,11 +738,14 @@ class CanvasWidget(QWidget):
 
     def mouseReleaseEvent(self, _e: QMouseEvent) -> None:  # noqa: N802
         was_editing = self._mode in {
-            _DragMode.PAN_PHOTO, _DragMode.MOVE_ITEM, _DragMode.ROTATE,
+            _DragMode.PAN_PHOTO, _DragMode.MOVE_ITEM,
+            _DragMode.RESIZE_ITEM, _DragMode.ROTATE,
         }
         self._mode = _DragMode.NONE
         self._drag_index = -1
+        self._snap_guides = []
         self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
         if was_editing:
             self.editFinished.emit()
 
@@ -506,6 +756,15 @@ class CanvasWidget(QWidget):
         if idx >= 0:
             self.select(idx)
             self.photoLoadRequested.emit(idx)
+
+    def contextMenuEvent(self, e) -> None:  # noqa: N802
+        if self.project is None:
+            return
+        idx = self._hit_item(self._to_sheet(e.pos()))
+        if idx >= 0:
+            self.select(idx)
+        self.contextMenuRequested.emit(idx, e.globalPos())
+        e.accept()
 
     def wheelEvent(self, e: QWheelEvent) -> None:  # noqa: N802
         if self.project is None or not self.project.items:
@@ -564,6 +823,10 @@ class CanvasWidget(QWidget):
             return
         if key == Qt.Key.Key_D and e.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.duplicateRequested.emit(self.selected)
+            e.accept()
+            return
+        if key == Qt.Key.Key_V and e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.pasteRequested.emit(self.selected)
             e.accept()
             return
         if key in {Qt.Key.Key_Left, Qt.Key.Key_Right,

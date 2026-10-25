@@ -3,7 +3,7 @@
 ; Результат: dist\installer\Softpalaroid-Setup-<версия>.exe
 
 #define MyAppName "Softpalaroid"
-#define MyAppVersion "0.5.0"
+#define MyAppVersion "0.6.0"
 #define MyAppPublisher "gjjut"
 #define MyAppURL "https://github.com/gjjut/Softpalaroid"
 #define MyAppExeName "Softpalaroid.exe"
@@ -26,6 +26,7 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+ChangesAssociations=yes
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Languages]
@@ -34,9 +35,16 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "fileassoc"; Description: "Ассоциировать проекты .softpalaroid с Softpalaroid"; GroupDescription: "Файлы проектов:"
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Registry]
+Root: HKA; Subkey: "Software\Classes\.softpalaroid"; ValueType: string; ValueName: ""; ValueData: "Softpalaroid.Project"; Flags: uninsdeletevalue; Tasks: fileassoc
+Root: HKA; Subkey: "Software\Classes\Softpalaroid.Project"; ValueType: string; ValueName: ""; ValueData: "Проект Softpalaroid"; Flags: uninsdeletekey; Tasks: fileassoc
+Root: HKA; Subkey: "Software\Classes\Softpalaroid.Project\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName},0"; Tasks: fileassoc
+Root: HKA; Subkey: "Software\Classes\Softpalaroid.Project\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Tasks: fileassoc
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

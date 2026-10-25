@@ -145,7 +145,7 @@ QPushButton[segment="true"]:checked {
 }
 
 /* --- поля ввода и списки --- */
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+QLineEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background-color: #16181C;
     border: 1px solid #333639;
     border-radius: 12px;
@@ -153,7 +153,7 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     selection-background-color: #1D9BF0;
     selection-color: #FFFFFF;
 }
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
     border-color: #1D9BF0;
 }
 QSpinBox::up-button, QDoubleSpinBox::up-button,
@@ -176,6 +176,28 @@ QComboBox QAbstractItemView {
     selection-background-color: #1D9BF0;
     selection-color: #FFFFFF;
     outline: none;
+}
+
+QDialog { background-color: #000000; }
+QLabel#DialogTitle { font-size: 18px; font-weight: 800; color: #E7E9EA; }
+QListWidget {
+    background-color: #16181C;
+    border: 1px solid #2F3336;
+    border-radius: 12px;
+    padding: 6px;
+    outline: none;
+}
+QListWidget::item { padding: 7px 9px; border-radius: 8px; }
+QListWidget::item:selected {
+    background-color: #1D9BF0; color: #FFFFFF;
+}
+QCheckBox { spacing: 8px; color: #E7E9EA; }
+QCheckBox::indicator {
+    width: 16px; height: 16px; border-radius: 5px;
+    border: 1px solid #536471; background-color: #16181C;
+}
+QCheckBox::indicator:checked {
+    background-color: #1D9BF0; border-color: #1D9BF0;
 }
 
 /* --- слайдеры --- */

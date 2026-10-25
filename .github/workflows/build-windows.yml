@@ -47,6 +47,23 @@ jobs:
       - name: Build Softpalaroid.exe (PyInstaller)
         run: pyinstaller packaging/Softpalaroid.spec --noconfirm
 
+      - name: Smoke packaged executable codecs/rendering
+        shell: pwsh
+        run: |
+          $out = Join-Path $PWD "packaged-self-test.log"
+          $process = Start-Process -FilePath "dist\Softpalaroid\Softpalaroid.exe" -ArgumentList @("--self-test", $out) -Wait -PassThru
+          "### Packaged executable self-test" >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path $out) {
+            Get-Content $out
+            '```' >> $env:GITHUB_STEP_SUMMARY
+            Get-Content $out >> $env:GITHUB_STEP_SUMMARY
+            '```' >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            "::error::Packaged self-test did not create a log file"
+          }
+          if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+          if (-not (Test-Path $out)) { exit 1 }
+
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
 
