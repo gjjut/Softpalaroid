@@ -29,7 +29,20 @@ jobs:
       - name: GUI smoke test (offscreen)
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python tools/smoke_gui.py
+        shell: pwsh
+        run: |
+          python tools/smoke_gui.py 2>&1 | Tee-Object -FilePath smoke.log
+          $code = $LASTEXITCODE
+          "### GUI smoke test" >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          Get-Content smoke.log >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          if ($code -ne 0) {
+            Get-Content smoke.log -Tail 12 | ForEach-Object {
+              "::error::$($_ -replace '%','%25' -replace "`r",'%0D')"
+            }
+            exit $code
+          }
 
       - name: Build Softpalaroid.exe (PyInstaller)
         run: pyinstaller packaging/Softpalaroid.spec --noconfirm

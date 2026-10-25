@@ -19,10 +19,16 @@ from softpalaroid.main_window import MainWindow  # noqa: E402
 from softpalaroid.render import save_sheet  # noqa: E402
 
 
+def _stage(name: str) -> None:
+    print(f"[smoke] {name}", flush=True)
+
+
 def main() -> None:
+    _stage("QApplication + MainWindow")
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
+    _stage("window shown")
 
     with tempfile.TemporaryDirectory() as tmp:
         photo = os.path.join(tmp, "photo.jpg")
@@ -43,15 +49,20 @@ def main() -> None:
             item.filter = "vintage"
             win.canvas.refresh_item_pixmap(i)
 
+        _stage("photos loaded, grab canvas")
         app.processEvents()
         grab = win.canvas.grab()  # прогнать paintEvent предпросмотра
-        assert not grab.isNull()
+        assert not grab.isNull(), "canvas grab is null"
 
+        _stage("export sheet")
         out = os.path.join(tmp, "sheet.jpg")
         save_sheet(win.project, out)
-        result = Image.open(out)
-        assert result.size == (1181, 1772), result.size
-        assert result.info.get("dpi") == (300, 300), result.info.get("dpi")
+        # with: файл обязательно закрыть, иначе Windows не удалит временную папку
+        with Image.open(out) as result:
+            result.load()
+            assert result.size == (1181, 1772), result.size
+            assert result.info.get("dpi") == (300, 300), result.info.get("dpi")
+        _stage("export verified")
 
     win.close()
     app.quit()

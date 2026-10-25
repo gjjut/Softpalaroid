@@ -20,10 +20,16 @@ SS = 2  # supersampling карточки для гладких краёв пос
 
 
 def load_photo(path: str) -> Image.Image:
-    """Загрузить фото с учётом EXIF-ориентации, в RGB."""
-    img = Image.open(path)
-    img = ImageOps.exif_transpose(img)
-    return img.convert("RGB")
+    """Загрузить фото с учётом EXIF-ориентации, в RGB.
+
+    Возвращается полностью загруженная копия, файл сразу закрывается —
+    важно для Windows (открытый файл нельзя удалить/перезаписать).
+    """
+    with Image.open(path) as src:
+        img = ImageOps.exif_transpose(src)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        return img.copy()
 
 
 def _font_candidates() -> list[str]:
