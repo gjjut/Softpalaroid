@@ -21,10 +21,16 @@ from pathlib import Path, PurePosixPath
 
 from . import __version__
 from .image_io import probe_image_size
-from .model import PolaroidItem, Project, DEFAULT_SAFE_MARGIN_MM, stable_grain_seed
+from .model import (
+    DEFAULT_BACKGROUND_COLOR2,
+    DEFAULT_SAFE_MARGIN_MM,
+    PolaroidItem,
+    Project,
+    stable_grain_seed,
+)
 
 FORMAT_NAME = "softpalaroid-project"
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 PROJECT_EXTENSION = ".softpalaroid"
 PROJECT_FILE_FILTER = "Проект Softpalaroid (*.softpalaroid);;Все файлы (*)"
 MANIFEST_NAME = "manifest.json"
@@ -80,6 +86,8 @@ def project_state_dict(project: Project) -> dict:
     return {
         "landscape": bool(project.landscape),
         "background_color": project.background_color,
+        "background_style": project.background_style,
+        "background_color2": project.background_color2,
         "cut_marks": bool(project.cut_marks),
         "paper_size": project.paper_size,
         "sheet_width_cm": float(project.sheet_width_cm),
@@ -135,6 +143,8 @@ def save_project_file(project: Project, path: str | os.PathLike,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "landscape": bool(project.landscape),
         "background_color": project.background_color,
+        "background_style": project.background_style,
+        "background_color2": project.background_color2,
         "cut_marks": bool(project.cut_marks),
         "paper_size": project.paper_size,
         "sheet_width_cm": float(project.sheet_width_cm),
@@ -253,6 +263,9 @@ def load_project_file(path: str | os.PathLike,
             project = Project(
                 landscape=landscape,
                 background_color=str(manifest.get("background_color", "#ffffff")),
+                background_style=str(manifest.get("background_style", "solid")),
+                background_color2=str(manifest.get(
+                    "background_color2", DEFAULT_BACKGROUND_COLOR2)),
                 cut_marks=_bool_value(manifest, "cut_marks", True),
                 paper_size=str(manifest.get("paper_size", "10x15")),
                 sheet_width_cm=_float_value(

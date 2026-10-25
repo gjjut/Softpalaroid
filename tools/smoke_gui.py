@@ -13,6 +13,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from PIL import Image, ImageDraw  # noqa: E402
+from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtGui import QFontDatabase, QImage  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -240,6 +241,60 @@ def main() -> None:
                 "style": False, "output": True, "hints": False}.items():
             win._section_cards[key].set_expanded(expanded)  # noqa: SLF001
         win.canvas.select(0)
+
+        _stage("v0.8 theme / background styles / arrange / zoom toolbar")
+        initial_theme = win._ui_theme  # noqa: SLF001
+        win.theme_button.click()
+        app.processEvents()
+        flipped = "light" if initial_theme == "dark" else "dark"
+        assert win._ui_theme == flipped  # noqa: SLF001
+        assert win.canvas._ui_theme == flipped  # noqa: SLF001
+        assert "Тема:" in win.theme_button.text()
+        assert str(QSettings("Softpalaroid", "Softpalaroid").value(
+            "ui/theme")) == flipped
+        win.theme_button.click()
+        app.processEvents()
+        assert win._ui_theme == initial_theme  # noqa: SLF001
+        assert str(QSettings("Softpalaroid", "Softpalaroid").value(
+            "ui/theme")) == initial_theme
+
+        win.background_gallery._activate("gradient")  # noqa: SLF001
+        app.processEvents()
+        assert win.project.background_style == "gradient"
+        assert win.background_gallery.current_key() == "gradient"
+        assert win.background2_button.isEnabled()
+        win._set_background_color2("#123456")  # noqa: SLF001
+        assert win.project.background_color2 == "#123456"
+        win.background_gallery._activate("dots")  # noqa: SLF001
+        assert win.project.background_style == "dots"
+        win.background_gallery._activate("solid")  # noqa: SLF001
+        app.processEvents()
+        assert win.project.background_style == "solid"
+        assert not win.background2_button.isEnabled()
+
+        assert win.distribute_x_button.isEnabled()
+        win.align_buttons["left"].click()
+        app.processEvents()
+        lefts = [item.bounds_sheet()[0] for item in win.project.items]
+        assert max(lefts) - min(lefts) < 1.0, lefts
+        win._arrange_cards("scatter")  # noqa: SLF001
+        rotations = [abs(item.rotation) for item in win.project.items]
+        assert max(rotations) <= 4.0 + 1e-6
+        assert max(rotations) > 0.01
+        win.straighten_button.click()
+        app.processEvents()
+        assert all(item.rotation == 0.0 for item in win.project.items)
+
+        assert win.canvas._zoom_toolbar.isVisible()  # noqa: SLF001
+        win.canvas.set_view_zoom(2.0)
+        assert win.canvas._view_zoom == 2.0  # noqa: SLF001
+        assert win.canvas._zoom_label.text() == "200%"  # noqa: SLF001
+        win.canvas.zoom_step(0.5)
+        assert win.canvas._view_zoom == 1.0  # noqa: SLF001
+        win.canvas.set_view_zoom(99.0)
+        assert win.canvas._view_zoom == 5.0  # noqa: SLF001
+        win.canvas.reset_view()
+        assert win.canvas._zoom_label.text() == "100%"  # noqa: SLF001
 
         _stage("return to classic 10x15 for final export")
         paper_idx = win.paper_combo.findData("10x15")
