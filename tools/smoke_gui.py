@@ -36,6 +36,7 @@ def main() -> None:
     assert any(f.startswith("Inter") for f in families), "Inter font not registered"
     assert any(f.startswith("Caveat") for f in families), "Caveat font not registered"
     win = MainWindow()
+    win._skip_unsaved_prompt = True  # noqa: SLF001 - headless-тест без диалогов
     win.show()
     _stage("window shown")
 
@@ -62,6 +63,22 @@ def main() -> None:
         app.processEvents()
         grab = win.canvas.grab()  # прогнать paintEvent предпросмотра
         assert not grab.isNull(), "canvas grab is null"
+
+        _stage("project save + undo/redo + reopen")
+        project_file = os.path.join(tmp, "demo.softpalaroid")
+        assert win._save_project_to(project_file)  # noqa: SLF001
+        assert not win._is_dirty()  # noqa: SLF001
+        original_caption = win.project.items[0].caption
+        win.canvas.select(0)
+        win._set_item(caption="Изменено", refresh_pixmap=False)  # noqa: SLF001
+        win._undo()  # noqa: SLF001
+        assert win.project.items[0].caption == original_caption
+        win._redo()  # noqa: SLF001
+        assert win.project.items[0].caption == "Изменено"
+        assert win._open_project_from(  # noqa: SLF001
+            project_file, confirm_discard=False)
+        assert win.project.items[0].caption == original_caption
+        assert not win._is_dirty()  # noqa: SLF001
 
         _stage("export sheet")
         out = os.path.join(tmp, "sheet.jpg")

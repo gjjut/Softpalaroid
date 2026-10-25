@@ -1,15 +1,20 @@
 """Главное окно Softpalaroid."""
 from __future__ import annotations
 
+import copy
 import os
+import tempfile
+from datetime import datetime
 
 from PIL import UnidentifiedImageError
-from PySide6.QtCore import QRect, QSize, QSizeF, Qt
+from PySide6.QtCore import QRect, QSettings, QSize, QSizeF, QStandardPaths, QTimer, Qt
 from PySide6.QtGui import (
     QAction,
+    QCloseEvent,
     QDragEnterEvent,
     QDropEvent,
     QImage,
+    QKeySequence,
     QPainter,
     QPixmap,
 )
@@ -41,11 +46,21 @@ from . import __version__
 from .canvas import CanvasWidget
 from .filters import FILTERS
 from .model import PolaroidItem, Project
+from .project_io import (
+    PROJECT_EXTENSION,
+    PROJECT_FILE_FILTER,
+    ProjectFileError,
+    load_project_file,
+    project_state_key,
+    save_project_file,
+)
 from .render import load_photo, render_sheet, save_sheet
 from .resources import asset_path
 
 IMAGE_FILTER = "Изображения (*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff);;Все файлы (*)"
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
+HISTORY_LIMIT = 100
+AUTOSAVE_FILENAME = "autosave.softpalaroid"
 
 
 class MainWindow(QMainWindow):
@@ -59,11 +74,37 @@ class MainWindow(QMainWindow):
         self.project = Project()
         self.project.set_layout(1, landscape=True)
 
+        # Состояние проекта, истории и автосохранения
+        self._settings = QSettings("Softpalaroid", "Softpalaroid")
+        self._project_path: str | None = None
+        self._project_tempdir: tempfile.TemporaryDirectory | None = None
+        self._saved_state_key: str | None = project_state_key(self.project)
+        self._undo_stack: list[tuple[Project, int]] = []
+        self._redo_stack: list[tuple[Project, int]] = []
+        self._pending_before: tuple[Project, int] | None = None
+        self._applying_state = False
+        self._skip_unsaved_prompt = False
+        self._recent_menus: list[QMenu] = []
+        self._subtitle_label: QLabel | None = None
+
+        self._history_timer = QTimer(self)
+        self._history_timer.setSingleShot(True)
+        self._history_timer.setInterval(700)
+        self._history_timer.timeout.connect(self._flush_pending_history)
+
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(1500)
+        self._autosave_timer.timeout.connect(self._write_autosave)
+
         self.canvas = CanvasWidget()
         self.canvas.set_project(self.project)
         self.canvas.selectionChanged.connect(lambda _i: self._sync_panel())
         self.canvas.itemChanged.connect(self._sync_panel)
+        self.canvas.itemChanged.connect(self._update_project_ui)
         self.canvas.photoLoadRequested.connect(self._load_photo_dialog)
+        self.canvas.editStarted.connect(self._begin_canvas_edit)
+        self.canvas.editFinished.connect(self._finish_canvas_edit)
 
         self._build_actions()
         panel = self._build_panel()
@@ -89,21 +130,50 @@ class MainWindow(QMainWindow):
             "Колесо мыши — масштаб фото • Shift+колесо — наклон • "
             "Ctrl+колесо — масштаб просмотра • перетаскивание — сдвиг фото/карточки")
         self._sync_panel()
+        self._update_project_ui()
+        self._update_history_actions()
 
     # ------------------------------------------------------- действия и шапка
     def _build_actions(self) -> None:
+        self.act_new_project = QAction("Новый проект", self)
+        self.act_new_project.setShortcut("Ctrl+N")
+        self.act_new_project.triggered.connect(self._new_project)
+
+        self.act_open_project = QAction("Открыть проект…", self)
+        self.act_open_project.setShortcut("Ctrl+Shift+O")
+        self.act_open_project.triggered.connect(self._open_project_dialog)
+
+        self.act_save_project = QAction("Сохранить проект", self)
+        self.act_save_project.setShortcut("Ctrl+S")
+        self.act_save_project.triggered.connect(self._save_project)
+
+        self.act_save_project_as = QAction("Сохранить проект как…", self)
+        self.act_save_project_as.setShortcut("Ctrl+Shift+S")
+        self.act_save_project_as.triggered.connect(self._save_project_as)
+
         self.act_open = QAction("Загрузить фото…", self)
         self.act_open.setShortcut("Ctrl+O")
         self.act_open.triggered.connect(
             lambda: self._load_photo_dialog(self._selected_index()))
 
-        self.act_save = QAction("Сохранить лист 10×15…", self)
-        self.act_save.setShortcut("Ctrl+S")
-        self.act_save.triggered.connect(self._export_dialog)
+        self.act_export = QAction("Экспорт листа JPG/PNG…", self)
+        self.act_export.setShortcut("Ctrl+E")
+        self.act_export.triggered.connect(self._export_dialog)
 
         self.act_print = QAction("Печать…", self)
         self.act_print.setShortcut("Ctrl+P")
         self.act_print.triggered.connect(self._print_dialog)
+
+        self.act_undo = QAction("Отменить", self)
+        self.act_undo.setShortcut("Ctrl+Z")
+        self.act_undo.triggered.connect(self._undo)
+        self.act_undo.setEnabled(False)
+
+        self.act_redo = QAction("Повторить", self)
+        self.act_redo.setShortcuts(
+            [QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
+        self.act_redo.triggered.connect(self._redo)
+        self.act_redo.setEnabled(False)
 
         self.act_about = QAction("О программе", self)
         self.act_about.triggered.connect(self._about)
@@ -112,8 +182,73 @@ class MainWindow(QMainWindow):
         self.act_quit.setShortcut("Ctrl+Q")
         self.act_quit.triggered.connect(self.close)
 
-        self.addActions([self.act_open, self.act_save, self.act_print,
-                         self.act_about, self.act_quit])
+        self.addActions([
+            self.act_new_project, self.act_open_project,
+            self.act_save_project, self.act_save_project_as,
+            self.act_open, self.act_export, self.act_print,
+            self.act_undo, self.act_redo, self.act_about, self.act_quit,
+        ])
+
+    # -------------------------------------------------------- недавние проекты
+    def _recent_project_paths(self) -> list[str]:
+        value = self._settings.value("recentProjects", [])
+        if isinstance(value, str):
+            return [value] if value else []
+        if isinstance(value, (list, tuple)):
+            return [str(v) for v in value if str(v)]
+        return []
+
+    def _add_recent_project(self, path: str) -> None:
+        absolute = os.path.abspath(path)
+        paths = [p for p in self._recent_project_paths()
+                 if os.path.abspath(p) != absolute]
+        paths.insert(0, absolute)
+        self._settings.setValue("recentProjects", paths[:8])
+        self._settings.sync()
+        self._refresh_recent_menus()
+
+    def _remove_recent_project(self, path: str) -> None:
+        absolute = os.path.abspath(path)
+        paths = [p for p in self._recent_project_paths()
+                 if os.path.abspath(p) != absolute]
+        self._settings.setValue("recentProjects", paths)
+        self._settings.sync()
+        self._refresh_recent_menus()
+
+    def _clear_recent_projects(self) -> None:
+        self._settings.remove("recentProjects")
+        self._settings.sync()
+        self._refresh_recent_menus()
+
+    def _refresh_recent_menus(self) -> None:
+        paths = self._recent_project_paths()
+        for menu in self._recent_menus:
+            menu.clear()
+            if not paths:
+                empty = QAction("Нет недавних проектов", menu)
+                empty.setEnabled(False)
+                menu.addAction(empty)
+                continue
+            for path in paths:
+                action = QAction(os.path.basename(path), menu)
+                action.setToolTip(path)
+                action.triggered.connect(
+                    lambda _checked=False, p=path: self._open_project_from(p))
+                menu.addAction(action)
+            menu.addSeparator()
+            clear = QAction("Очистить список", menu)
+            clear.triggered.connect(self._clear_recent_projects)
+            menu.addAction(clear)
+
+    def _make_project_menu(self, parent: QWidget) -> QMenu:
+        menu = QMenu("Проект", parent)
+        menu.addActions([self.act_new_project, self.act_open_project])
+        recent = menu.addMenu("Недавние проекты")
+        self._recent_menus.append(recent)
+        menu.addSeparator()
+        menu.addActions([self.act_save_project, self.act_save_project_as])
+        self._refresh_recent_menus()
+        return menu
 
     def _build_header(self) -> QFrame:
         header = QFrame()
@@ -138,8 +273,9 @@ class MainWindow(QMainWindow):
         titles.setSpacing(0)
         title = QLabel("Softpalaroid")
         title.setObjectName("appTitle")
-        subtitle = QLabel("Полароиды на листе 10×15 · готово к печати")
+        subtitle = QLabel("Новый проект · лист 10×15")
         subtitle.setObjectName("appSubtitle")
+        self._subtitle_label = subtitle
         titles.addWidget(title)
         titles.addWidget(subtitle)
         lay.addLayout(titles)
@@ -149,13 +285,45 @@ class MainWindow(QMainWindow):
         version.setObjectName("versionChip")
         lay.addWidget(version)
 
+        self._undo_button = QToolButton()
+        self._undo_button.setObjectName("moreButton")
+        self._undo_button.setText("↶")
+        self._undo_button.setToolTip("Отменить (Ctrl+Z)")
+        self._undo_button.setAccessibleName("Отменить")
+        self._undo_button.setFixedSize(42, 42)
+        self._undo_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._undo_button.clicked.connect(self.act_undo.trigger)
+        self._undo_button.setEnabled(False)
+        lay.addWidget(self._undo_button)
+
+        self._redo_button = QToolButton()
+        self._redo_button.setObjectName("moreButton")
+        self._redo_button.setText("↷")
+        self._redo_button.setToolTip("Повторить (Ctrl+Y)")
+        self._redo_button.setAccessibleName("Повторить")
+        self._redo_button.setFixedSize(42, 42)
+        self._redo_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._redo_button.clicked.connect(self.act_redo.trigger)
+        self._redo_button.setEnabled(False)
+        lay.addWidget(self._redo_button)
+
+        project_button = QToolButton()
+        project_button.setText("Проект ▾")
+        project_button.setMinimumHeight(42)
+        project_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        project_button.setToolTip("Новый, открыть или сохранить проект")
+        project_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup)
+        project_button.setMenu(self._make_project_menu(project_button))
+        lay.addWidget(project_button)
+
         btn_print = QPushButton("Печать")
         btn_print.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_print.setMinimumHeight(42)
         btn_print.clicked.connect(self._print_dialog)
         lay.addWidget(btn_print)
 
-        btn_save = QPushButton("Сохранить лист")
+        btn_save = QPushButton("Экспорт листа")
         btn_save.setObjectName("primaryButton")
         btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save.setMinimumHeight(42)
@@ -170,7 +338,10 @@ class MainWindow(QMainWindow):
         more.setToolTip("Ещё")
         more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QMenu(more)
-        menu.addActions([self.act_open, self.act_save, self.act_print])
+        menu.addActions([self.act_undo, self.act_redo])
+        menu.addSeparator()
+        menu.addMenu(self._make_project_menu(menu))
+        menu.addActions([self.act_open, self.act_export, self.act_print])
         menu.addSeparator()
         menu.addAction(self.act_about)
         menu.addSeparator()
@@ -398,6 +569,7 @@ class MainWindow(QMainWindow):
         return self.project.items[self._selected_index()]
 
     def _set_item(self, refresh_pixmap: bool = True, **fields) -> None:
+        before = self._snapshot_state()
         item = self._item()
         for name, value in fields.items():
             setattr(item, name, value)
@@ -406,6 +578,383 @@ class MainWindow(QMainWindow):
             self.canvas.refresh_item_pixmap(self._selected_index())
         self.canvas.update()
         self._sync_panel(from_item=True)
+        self._note_change(before)
+
+    # -------------------------------------------- состояние, история, автосейв
+    def _snapshot_state(self) -> tuple[Project, int]:
+        return (copy.deepcopy(self.project), self.canvas.selected)
+
+    def _is_dirty(self) -> bool:
+        return self._saved_state_key is None \
+            or project_state_key(self.project) != self._saved_state_key
+
+    def _update_project_ui(self) -> None:
+        dirty = self._is_dirty()
+        name = os.path.basename(self._project_path) \
+            if self._project_path else "Новый проект"
+        self.setWindowTitle(
+            f"Softpalaroid — {name}{' *' if dirty else ''}")
+        if self._subtitle_label is not None:
+            if self._project_path:
+                state = "не сохранено" if dirty else "сохранено"
+                self._subtitle_label.setText(f"{name} · {state} · лист 10×15")
+            elif dirty:
+                self._subtitle_label.setText("Новый проект · не сохранено · лист 10×15")
+            else:
+                self._subtitle_label.setText("Новый проект · лист 10×15")
+
+    def _update_history_actions(self) -> None:
+        can_undo = bool(self._undo_stack or self._pending_before)
+        can_redo = bool(self._redo_stack)
+        if hasattr(self, "act_undo"):
+            self.act_undo.setEnabled(can_undo)
+        if hasattr(self, "act_redo"):
+            self.act_redo.setEnabled(can_redo)
+        if hasattr(self, "_undo_button"):
+            self._undo_button.setEnabled(can_undo)
+        if hasattr(self, "_redo_button"):
+            self._redo_button.setEnabled(can_redo)
+
+    def _after_state_changed(self) -> None:
+        self._update_project_ui()
+        self._update_history_actions()
+        if self._is_dirty():
+            self._autosave_timer.start()
+        else:
+            self._autosave_timer.stop()
+            self._remove_autosave_file()
+
+    def _push_before(self, before: tuple[Project, int]) -> None:
+        if project_state_key(before[0]) == project_state_key(self.project):
+            return
+        self._undo_stack.append(before)
+        if len(self._undo_stack) > HISTORY_LIMIT:
+            del self._undo_stack[:len(self._undo_stack) - HISTORY_LIMIT]
+        self._redo_stack.clear()
+
+    def _note_change(self, before: tuple[Project, int] | None = None) -> None:
+        """Зафиксировать изменение с объединением непрерывных правок."""
+        if self._applying_state:
+            self._after_state_changed()
+            return
+        if before is not None and self._pending_before is None:
+            self._pending_before = before
+        if self._pending_before is not None:
+            self._history_timer.start()
+        self._after_state_changed()
+
+    def _commit_change(self, before: tuple[Project, int] | None = None) -> None:
+        self._history_timer.stop()
+        candidate = self._pending_before or before
+        self._pending_before = None
+        if not self._applying_state and candidate is not None:
+            self._push_before(candidate)
+        self._after_state_changed()
+
+    def _flush_pending_history(self) -> None:
+        if self._pending_before is not None:
+            self._commit_change()
+
+    def _clear_history(self) -> None:
+        self._history_timer.stop()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._pending_before = None
+        self._update_history_actions()
+
+    def _begin_canvas_edit(self) -> None:
+        if self._applying_state:
+            return
+        if self._pending_before is None:
+            self._pending_before = self._snapshot_state()
+        self._history_timer.stop()
+        self._update_history_actions()
+
+    def _finish_canvas_edit(self) -> None:
+        self._commit_change()
+
+    def _sync_layout_controls(self) -> None:
+        if not hasattr(self, "rb_land"):
+            return
+        controls = [self.rb_land, self.rb_port, *self.count_buttons.values()]
+        blockers = [c.blockSignals(True) for c in controls]
+        try:
+            self.rb_land.setChecked(self.project.landscape)
+            self.rb_port.setChecked(not self.project.landscape)
+            for count, button in self.count_buttons.items():
+                button.setChecked(count == len(self.project.items))
+        finally:
+            for control, blocked in zip(controls, blockers):
+                control.blockSignals(blocked)
+
+    def _apply_state(self, state: tuple[Project, int]) -> None:
+        project, selected = state
+        self._applying_state = True
+        self._history_timer.stop()
+        try:
+            self.project.landscape = project.landscape
+            self.project.items = copy.deepcopy(project.items)
+            if self.project.items:
+                self.canvas.selected = max(
+                    0, min(len(self.project.items) - 1, selected))
+            else:
+                self.canvas.selected = 0
+            self.canvas.refresh_all_pixmaps()
+            self._sync_layout_controls()
+            self._sync_panel()
+            self.canvas.update()
+        finally:
+            self._applying_state = False
+        self._after_state_changed()
+
+    def _replace_project(self, project: Project, selected: int = 0) -> None:
+        self._clear_history()
+        self._apply_state((project, selected))
+        self._clear_history()
+
+    def _undo(self) -> None:
+        self._flush_pending_history()
+        if not self._undo_stack:
+            return
+        current = self._snapshot_state()
+        target = self._undo_stack.pop()
+        self._redo_stack.append(current)
+        self._apply_state(target)
+        self.statusBar().showMessage("Действие отменено", 2500)
+
+    def _redo(self) -> None:
+        self._flush_pending_history()
+        if not self._redo_stack:
+            return
+        current = self._snapshot_state()
+        target = self._redo_stack.pop()
+        self._undo_stack.append(current)
+        self._apply_state(target)
+        self.statusBar().showMessage("Действие повторено", 2500)
+
+    # ------------------------------------------------------------- автосейв
+    def _autosave_path(self) -> str:
+        root = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.AppDataLocation)
+        if not root:
+            root = os.path.join(os.path.expanduser("~"), ".softpalaroid")
+        return os.path.join(root, AUTOSAVE_FILENAME)
+
+    def _write_autosave(self) -> None:
+        if self._applying_state or not self._is_dirty():
+            return
+        try:
+            save_project_file(
+                self.project,
+                self._autosave_path(),
+                selected_index=self.canvas.selected,
+                metadata={
+                    "autosave": True,
+                    "source_path": self._project_path or "",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - автосейв не должен ронять GUI
+            self.statusBar().showMessage(
+                f"Автосохранение не удалось: {exc}", 5000)
+
+    def _remove_autosave_file(self) -> None:
+        try:
+            path = self._autosave_path()
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def offer_autosave_recovery(self) -> None:
+        """Предложить восстановить работу после аварийного завершения."""
+        path = self._autosave_path()
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return
+        try:
+            when = datetime.fromtimestamp(os.path.getmtime(path)) \
+                .astimezone().strftime("%d.%m.%Y %H:%M")
+        except OSError:
+            when = "неизвестно"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Восстановление работы")
+        box.setText(
+            "Найдено автосохранение несохранённой работы "
+            f"({when}). Восстановить его?")
+        restore = box.addButton(
+            "Восстановить", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(
+            "Удалить автосохранение", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(restore)
+        box.exec()
+        if box.clickedButton() is restore:
+            self._open_project_from(
+                path, confirm_discard=False,
+                add_recent=False, from_autosave=True)
+        else:
+            self._remove_autosave_file()
+
+    # --------------------------------------------------------------- проекты
+    def _set_project_tempdir(
+            self, tempdir: tempfile.TemporaryDirectory | None) -> None:
+        old = self._project_tempdir
+        self._project_tempdir = tempdir
+        if old is not None and old is not tempdir:
+            try:
+                old.cleanup()
+            except OSError:
+                pass
+
+    def _cleanup_project_tempdir(self) -> None:
+        self._set_project_tempdir(None)
+
+    def _confirm_discard_changes(self) -> bool:
+        self._flush_pending_history()
+        if self._skip_unsaved_prompt or not self._is_dirty():
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Несохранённые изменения")
+        box.setText("В проекте есть несохранённые изменения. Сохранить их?")
+        save_button = box.addButton(
+            "Сохранить", QMessageBox.ButtonRole.AcceptRole)
+        discard_button = box.addButton(
+            "Не сохранять", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(save_button)
+        box.exec()
+        if box.clickedButton() is save_button:
+            return self._save_project()
+        return box.clickedButton() is discard_button
+
+    def _new_project(self) -> None:
+        if not self._confirm_discard_changes():
+            return
+        project = Project()
+        project.set_layout(1, landscape=True)
+        self._replace_project(project, 0)
+        self._cleanup_project_tempdir()
+        self._project_path = None
+        self._saved_state_key = project_state_key(self.project)
+        self._remove_autosave_file()
+        self.canvas.reset_view()
+        self._after_state_changed()
+        self.statusBar().showMessage("Создан новый проект", 3000)
+
+    def _open_project_dialog(self) -> None:
+        start = self._project_path or ""
+        if not start:
+            recent = self._recent_project_paths()
+            start = recent[0] if recent else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Открыть проект Softpalaroid", start, PROJECT_FILE_FILTER)
+        if path:
+            self._open_project_from(path)
+
+    def _open_project_from(self, path: str, *,
+                           confirm_discard: bool = True,
+                           add_recent: bool = True,
+                           from_autosave: bool = False) -> bool:
+        if confirm_discard and not self._confirm_discard_changes():
+            return False
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            QMessageBox.warning(
+                self, "Проект не найден",
+                f"Файл проекта не существует:\n{path}")
+            if add_recent:
+                self._remove_recent_project(path)
+            return False
+
+        tempdir = tempfile.TemporaryDirectory(prefix="softpalaroid-project-")
+        try:
+            loaded = load_project_file(path, tempdir.name)
+        except (ProjectFileError, OSError) as exc:
+            tempdir.cleanup()
+            QMessageBox.critical(
+                self, "Не удалось открыть проект",
+                f"{os.path.basename(path)}\n\n{exc}")
+            return False
+
+        self._replace_project(loaded.project, loaded.selected_index)
+        self._set_project_tempdir(tempdir)
+
+        if from_autosave:
+            source = loaded.metadata.get("source_path")
+            self._project_path = source if isinstance(source, str) \
+                and source and os.path.abspath(source) != path else None
+            self._saved_state_key = None  # восстановленная работа не сохранена
+            message = "Несохранённая работа восстановлена"
+        else:
+            self._project_path = path
+            self._saved_state_key = None if loaded.warnings \
+                else project_state_key(self.project)
+            if add_recent:
+                self._add_recent_project(path)
+            if not loaded.warnings:
+                self._remove_autosave_file()
+            message = f"Проект открыт: {os.path.basename(path)}"
+
+        self.canvas.reset_view()
+        self._after_state_changed()
+        self.statusBar().showMessage(message, 5000)
+        if loaded.warnings:
+            QMessageBox.warning(
+                self, "Проект открыт с предупреждениями",
+                "\n".join(loaded.warnings))
+        return True
+
+    def _save_project(self) -> bool:
+        if not self._project_path:
+            return self._save_project_as()
+        return self._save_project_to(self._project_path)
+
+    def _save_project_as(self) -> bool:
+        start = self._project_path or f"Без названия{PROJECT_EXTENSION}"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить проект Softpalaroid", start, PROJECT_FILE_FILTER)
+        if not path:
+            return False
+        if not os.path.splitext(path)[1]:
+            path += PROJECT_EXTENSION
+        return self._save_project_to(path)
+
+    def _save_project_to(self, path: str) -> bool:
+        self._flush_pending_history()
+        path = os.path.abspath(path)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            save_project_file(
+                self.project, path,
+                selected_index=self.canvas.selected,
+                metadata={"source_path": path},
+            )
+        except Exception as exc:  # noqa: BLE001
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(
+                self, "Не удалось сохранить проект",
+                f"{os.path.basename(path)}\n\n{exc}")
+            return False
+        QApplication.restoreOverrideCursor()
+        self._project_path = path
+        self._saved_state_key = project_state_key(self.project)
+        self._add_recent_project(path)
+        self._remove_autosave_file()
+        self._after_state_changed()
+        self.statusBar().showMessage(
+            f"Проект сохранён: {os.path.basename(path)}", 5000)
+        return True
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        self._flush_pending_history()
+        if not self._confirm_discard_changes():
+            event.ignore()
+            return
+        self._history_timer.stop()
+        self._autosave_timer.stop()
+        self._remove_autosave_file()
+        self._cleanup_project_tempdir()
+        super().closeEvent(event)
 
     def _sync_panel(self, from_item: bool = False) -> None:
         if not self.project.items:
@@ -440,22 +989,28 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- действия
     def _orientation_changed(self, _checked: bool) -> None:
+        before = self._snapshot_state()
         self.project.set_layout(len(self.project.items), landscape=self.rb_land.isChecked())
         self.canvas.on_layout_changed()
         self.canvas.reset_view()
         self._sync_panel()
+        self._commit_change(before)
 
     def _count_changed(self, count: int) -> None:
+        before = self._snapshot_state()
         self.project.set_layout(count)
         if self.canvas.selected >= count:
             self.canvas.selected = 0
         self.canvas.on_layout_changed()
         self._sync_panel()
+        self._commit_change(before)
 
     def _reset_layout(self) -> None:
+        before = self._snapshot_state()
         self.project.set_layout(len(self.project.items), landscape=self.rb_land.isChecked())
         self.canvas.on_layout_changed()
         self.canvas.reset_view()
+        self._commit_change(before)
 
     def _load_photo_dialog(self, slot: int) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Выберите фото", "", IMAGE_FILTER)
@@ -463,13 +1018,15 @@ class MainWindow(QMainWindow):
             self._load_photo_into(slot, path)
             self.canvas.select(slot)
 
-    def _load_photo_into(self, slot: int, path: str) -> bool:
+    def _load_photo_into(self, slot: int, path: str,
+                         *, record_history: bool = True) -> bool:
         try:
             size = load_photo(path).size
         except (OSError, UnidentifiedImageError) as exc:
             QMessageBox.warning(self, "Не удалось открыть фото",
                                 f"{os.path.basename(path)}\n\n{exc}")
             return False
+        before = self._snapshot_state() if record_history else None
         item = self.project.items[slot]
         keep_filter, keep_caption = item.filter, item.caption
         item.set_photo(path, size)
@@ -478,6 +1035,8 @@ class MainWindow(QMainWindow):
         self._sync_panel()
         self.statusBar().showMessage(
             f"Фото добавлено в слот {slot + 1}: {os.path.basename(path)}", 5000)
+        if before is not None:
+            self._commit_change(before)
         return True
 
     def _duplicate_to_all(self) -> None:
@@ -486,6 +1045,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Нет фото",
                                     "Сначала загрузите фото в выбранный слот.")
             return
+        before = self._snapshot_state()
         for i, item in enumerate(self.project.items):
             if item is src:
                 continue
@@ -495,6 +1055,7 @@ class MainWindow(QMainWindow):
             item.filter = src.filter
             self.canvas.refresh_item_pixmap(i)
         self.canvas.update()
+        self._commit_change(before)
 
     def _warn_empty_slots(self) -> bool:
         empty = [i + 1 for i, it in enumerate(self.project.items) if not it.photo_path]
@@ -579,10 +1140,15 @@ class MainWindow(QMainWindow):
                  if u.toLocalFile().lower().endswith(IMAGE_EXTS)]
         if not files:
             return
+        before = self._snapshot_state()
+        loaded_any = False
         slot = self._selected_index()
         for path in files:
             if slot >= len(self.project.items):
                 break
-            if self._load_photo_into(slot, path):
+            if self._load_photo_into(slot, path, record_history=False):
+                loaded_any = True
                 slot += 1
+        if loaded_any:
+            self._commit_change(before)
         e.acceptProposedAction()

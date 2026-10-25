@@ -29,6 +29,7 @@ from PySide6.QtGui import (
     QPixmap,
     QWheelEvent,
 )
+from PIL import UnidentifiedImageError
 from PySide6.QtWidgets import QWidget
 
 from .filters import apply_filter
@@ -63,6 +64,8 @@ class CanvasWidget(QWidget):
     selectionChanged = Signal(int)
     itemChanged = Signal()
     photoLoadRequested = Signal(int)
+    editStarted = Signal()
+    editFinished = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -119,7 +122,12 @@ class CanvasWidget(QWidget):
         if not item.photo_path:
             self._pixmaps.pop(index, None)
             return
-        img = load_photo(item.photo_path)
+        try:
+            img = load_photo(item.photo_path)
+        except (OSError, UnidentifiedImageError):
+            self._pixmaps.pop(index, None)
+            self.update()
+            return
         item.photo_size = img.size
         img.thumbnail((PREVIEW_MAX_SIDE, PREVIEW_MAX_SIDE))
         img = apply_filter(img, item.filter)
@@ -128,6 +136,15 @@ class CanvasWidget(QWidget):
             QImage.Format.Format_RGB888,
         ).copy()
         self._pixmaps[index] = QPixmap.fromImage(qimg)
+        self.update()
+
+    def refresh_all_pixmaps(self) -> None:
+        """Перечитать превью всех слотов (после Undo/Redo или открытия проекта)."""
+        self._pixmaps.clear()
+        if self.project is None:
+            return
+        for i in range(len(self.project.items)):
+            self.refresh_item_pixmap(i)
         self.update()
 
     def select(self, index: int) -> None:
@@ -356,11 +373,13 @@ class CanvasWidget(QWidget):
             if e.modifiers() & Qt.KeyboardModifier.AltModifier:
                 self._begin_rotate(idx, sheet_pt)
             elif item.photo_path and self._in_photo(item, sheet_pt):
+                self.editStarted.emit()
                 self._mode = _DragMode.PAN_PHOTO
                 self._drag_index = idx
                 self._start_offset = (item.offset_x, item.offset_y)
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
             else:
+                self.editStarted.emit()
                 self._mode = _DragMode.MOVE_ITEM
                 self._drag_index = idx
                 self._grab_delta = QPointF(
@@ -372,6 +391,7 @@ class CanvasWidget(QWidget):
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def _begin_rotate(self, idx: int, sheet_pt: QPointF) -> None:
+        self.editStarted.emit()
         item = self.project.items[idx]  # type: ignore[union-attr]
         self._mode = _DragMode.ROTATE
         self._drag_index = idx
@@ -440,9 +460,14 @@ class CanvasWidget(QWidget):
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, _e: QMouseEvent) -> None:  # noqa: N802
+        was_editing = self._mode in {
+            _DragMode.PAN_PHOTO, _DragMode.MOVE_ITEM, _DragMode.ROTATE,
+        }
         self._mode = _DragMode.NONE
         self._drag_index = -1
         self.setCursor(Qt.CursorShape.ArrowCursor)
+        if was_editing:
+            self.editFinished.emit()
 
     def mouseDoubleClickEvent(self, e: QMouseEvent) -> None:  # noqa: N802
         if self.project is None:
@@ -485,6 +510,7 @@ class CanvasWidget(QWidget):
             self.select(idx)
         item = self.project.items[idx]
 
+        self.editStarted.emit()
         if mods & Qt.KeyboardModifier.ShiftModifier:
             item.rotation += steps * 2.0
         else:
@@ -492,6 +518,7 @@ class CanvasWidget(QWidget):
         item.clamp()
         self.itemChanged.emit()
         self.update()
+        self.editFinished.emit()
         e.accept()
 
     def keyPressEvent(self, e) -> None:  # noqa: N802
@@ -501,6 +528,9 @@ class CanvasWidget(QWidget):
         step = 0.1 if e.modifiers() & Qt.KeyboardModifier.ShiftModifier else 0.02
         item = self.project.items[self.selected]
         key = e.key()
+        if key in {Qt.Key.Key_Left, Qt.Key.Key_Right,
+                   Qt.Key.Key_Up, Qt.Key.Key_Down}:
+            self.editStarted.emit()
         moved = True
         if key == Qt.Key.Key_Left:
             item.offset_x -= step
@@ -516,6 +546,7 @@ class CanvasWidget(QWidget):
             item.clamp()
             self.itemChanged.emit()
             self.update()
+            self.editFinished.emit()
             e.accept()
         else:
             super().keyPressEvent(e)
