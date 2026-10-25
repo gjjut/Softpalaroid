@@ -1,7 +1,7 @@
-"""Рендер готового листа 10x15 см в полном разрешении 300 DPI (Pillow).
+"""Рендер готового листа в полном разрешении 300 DPI (Pillow).
 
-Используется и для сохранения JPG/PNG, и для печати, поэтому то, что видит
-пользователь в предпросмотре, полностью совпадает с результатом.
+Используется для сохранения JPG/PNG/PDF и печати, поэтому предпросмотр,
+экспорт и печатная страница строятся из одной и той же геометрии модели.
 """
 from __future__ import annotations
 
@@ -10,16 +10,15 @@ import sys
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .filters import apply_filter, transform_photo
-from .image_io import load_photo
+from .filters import apply_filter, apply_photo_adjustments, transform_photo
+from .image_io import load_photo, srgb_icc_profile
 from .model import (
     CUT_MARK_WIDTH_PX,
     DPI,
-    PHOTO_INSET_FRAC,
     PolaroidItem,
     Project,
     color_to_rgb,
-    relative_luminance,
+    cut_mark_rgb,
 )
 from .resources import asset_path
 
@@ -39,7 +38,8 @@ def _font_candidates() -> list[str]:
         fonts_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
         names += [
             os.path.join(fonts_dir, n)
-            for n in ("segoesc.ttf", "SegoePrint.ttf", "comic.ttf", "Gabriola.ttf", "Inkfree.ttf")
+            for n in ("segoesc.ttf", "SegoePrint.ttf", "comic.ttf",
+                      "Gabriola.ttf", "Inkfree.ttf")
         ]
     elif sys.platform == "darwin":
         names += [
@@ -70,20 +70,26 @@ def _caption_font(size_px: int) -> ImageFont.ImageFont:
     return ImageFont.load_default(size_px)
 
 
-def _fit_caption(draw: ImageDraw.ImageDraw, text: str, max_w: float, base_size: int) -> ImageFont.ImageFont:
-    size = base_size
+def _fit_caption(draw: ImageDraw.ImageDraw, text: str, max_w: float,
+                 base_size: int, max_h: float | None = None,
+                 align: str = "center") -> ImageFont.ImageFont:
+    """Подобрать размер шрифта для одно- или многострочной подписи."""
+    size = max(10, int(base_size))
     while size > 10:
         font = _caption_font(size)
-        if draw.textlength(text, font=font) <= max_w:
+        bbox = draw.multiline_textbbox((0, 0), text, font=font, align=align)
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        if width <= max_w and (max_h is None or height <= max_h):
             return font
-        size = int(size * 0.9)
+        size = max(10, int(size * 0.9))
     return _caption_font(max(10, size))
 
 
 def render_card(item: PolaroidItem, photo: Image.Image | None) -> Image.Image:
-    """Одна карточка (без наклона и тени) в RGBA, с supersampling x2."""
-    w = int(round(item.width)) * SS
-    h = int(round(item.height)) * SS
+    """Одна карточка без наклона и тени, RGBA с supersampling x2."""
+    w = max(1, int(round(item.width)) * SS)
+    h = max(1, int(round(item.height)) * SS)
     card = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(card)
 
@@ -96,12 +102,14 @@ def render_card(item: PolaroidItem, photo: Image.Image | None) -> Image.Image:
         width=max(1, SS),
     )
 
-    inset = item.width * PHOTO_INSET_FRAC * SS
-    side = item.photo_side * SS
-    x0, y0 = int(round(inset)), int(round(inset))
-    s = int(round(side))
+    px_f, py_f, pw_f, ph_f = item.photo_rect_local()
+    x0, y0 = int(round(px_f * SS)), int(round(py_f * SS))
+    pw, ph = max(1, int(round(pw_f * SS))), max(1, int(round(ph_f * SS)))
+    # Не даём округлению увести окно фотографии за пределы карточки.
+    pw = min(pw, max(1, w - x0))
+    ph = min(ph, max(1, h - y0))
 
-    if photo is not None and item.photo_size:
+    if photo is not None:
         oriented = transform_photo(
             photo,
             rotation=item.photo_rotation,
@@ -109,49 +117,83 @@ def render_card(item: PolaroidItem, photo: Image.Image | None) -> Image.Image:
             flip_vertical=item.flip_vertical,
         )
         iw, ih = oriented.size
-        scale = max(s / iw, s / ih) * item.zoom
-        dw, dh = max(1, round(iw * scale)), max(1, round(ih * scale))
-        resized = oriented.resize((dw, dh), Image.LANCZOS)
-        resized = apply_filter(resized, item.filter)
-        cx = int(round(item.offset_x * (dw - s)))
-        cy = int(round(item.offset_y * (dh - s)))
-        crop = resized.crop((cx, cy, cx + s, cy + s))
-        card.paste(crop, (x0, y0))
+        if iw > 0 and ih > 0:
+            scale = max(pw / iw, ph / ih) * item.zoom
+            dw, dh = max(pw, round(iw * scale)), max(ph, round(ih * scale))
+            resized = oriented.resize((dw, dh), Image.LANCZOS)
+            resized = apply_photo_adjustments(
+                resized,
+                brightness=item.brightness,
+                contrast=item.contrast,
+                saturation=item.saturation,
+                sharpness=item.sharpness,
+            )
+            resized = apply_filter(
+                resized,
+                item.filter,
+                seed=item.effective_grain_seed(),
+                intensity=item.filter_intensity,
+            )
+            cx = int(round(item.offset_x * max(0, dw - pw)))
+            cy = int(round(item.offset_y * max(0, dh - ph)))
+            cx = max(0, min(max(0, dw - pw), cx))
+            cy = max(0, min(max(0, dh - ph), cy))
+            crop = resized.crop((cx, cy, cx + pw, cy + ph))
+            card.paste(crop, (x0, y0))
+        else:
+            draw.rectangle(
+                [x0, y0, x0 + pw - 1, y0 + ph - 1],
+                fill=PLACEHOLDER_COLOR + (255,))
     else:
-        draw.rectangle([x0, y0, x0 + s, y0 + s], fill=PLACEHOLDER_COLOR + (255,))
+        draw.rectangle(
+            [x0, y0, x0 + pw - 1, y0 + ph - 1],
+            fill=PLACEHOLDER_COLOR + (255,))
 
-    # Тонкая внутренняя рамка вокруг фото
     draw.rectangle(
-        [x0, y0, x0 + s - 1, y0 + s - 1],
+        [x0, y0, x0 + pw - 1, y0 + ph - 1],
         outline=item.contrast_rgb + (46,),
         width=max(1, SS),
     )
 
-    if item.caption.strip():
-        bottom_top = y0 + s
-        area_h = h - bottom_top
-        font = _fit_caption(draw, item.caption, w * 0.88, int(area_h * 0.52))
-        draw.text(
-            (w / 2, bottom_top + area_h / 2),
-            item.caption,
+    caption = item.caption.strip("\r\n")
+    if caption.strip():
+        caption_top = y0 + ph
+        area_h = max(1, h - caption_top)
+        lines = max(1, len(caption.splitlines()))
+        divisor = 1.0 + 0.24 * (lines - 1)
+        base_size = int(area_h * 0.52 * item.caption_scale / divisor)
+        align = item.caption_align if item.caption_align in {
+            "left", "center", "right"} else "center"
+        font = _fit_caption(
+            draw, caption, w * 0.86, base_size,
+            max_h=area_h * 0.88, align=align)
+        center_y = caption_top + area_h / 2
+        if align == "left":
+            position = (w * 0.08, center_y)
+            anchor = "lm"
+        elif align == "right":
+            position = (w * 0.92, center_y)
+            anchor = "rm"
+        else:
+            position = (w / 2, center_y)
+            anchor = "mm"
+        draw.multiline_text(
+            position,
+            caption,
             font=font,
             fill=item.caption_rgb + (255,),
-            anchor="mm",
+            anchor=anchor,
+            align=align,
+            spacing=max(2, int(area_h * 0.04)),
         )
     return card
 
 
 def draw_cut_marks(sheet: Image.Image, project: Project,
                    background: tuple[int, int, int] | None = None) -> None:
-    """Нарисовать L-образные уголки обреза вокруг каждой карточки.
-
-    Метки рисуются на фон листа до самих карточек: так они видны вокруг
-    карточек, но не портят соседнюю карточку при наложении.
-    """
+    """Нарисовать L-образные уголки обреза вокруг каждой карточки."""
     bg = project.background_rgb if background is None else background
-    mark_color = ((92, 96, 102)
-                  if relative_luminance(bg) >= 0.45
-                  else (226, 229, 233))
+    mark_color = cut_mark_rgb("#%02x%02x%02x" % bg)
     draw = ImageDraw.Draw(sheet)
     width = max(1, int(round(CUT_MARK_WIDTH_PX)))
     for item in project.items:
@@ -159,37 +201,81 @@ def draw_cut_marks(sheet: Image.Image, project: Project,
             draw.line([start, end], fill=mark_color, width=width)
 
 
+def _load_photo_safely(item: PolaroidItem) -> Image.Image | None:
+    if not item.photo_path:
+        return None
+    try:
+        return load_photo(item.photo_path)
+    except Exception:  # noqa: BLE001 - preflight уже предупреждает пользователя
+        return None
+
+
+def _finished_card(item: PolaroidItem,
+                   photo: Image.Image | None) -> Image.Image:
+    card = render_card(item, photo)
+    rotated = card.rotate(-item.rotation, resample=Image.BICUBIC, expand=True)
+    if SS != 1:
+        rotated = rotated.resize(
+            (max(1, rotated.width // SS), max(1, rotated.height // SS)),
+            Image.LANCZOS)
+    return rotated
+
+
 def render_sheet(project: Project,
                  background: tuple[int, int, int] | None = None) -> Image.Image:
-    """Полный лист в экспортном разрешении (без теней карточек)."""
+    """Полный лист в экспортном разрешении, без теней карточек."""
     bg = project.background_rgb if background is None else background
     sheet = Image.new("RGB", (project.sheet_w, project.sheet_h), bg)
-
     if project.cut_marks:
         draw_cut_marks(sheet, project, bg)
-
     for item in project.items:
-        photo = load_photo(item.photo_path) if item.photo_path else None
-        card = render_card(item, photo)
-
-        # Поворот (Pillow крутит против часовой, нам нужна экранная система — по часовой)
-        rotated = card.rotate(-item.rotation, resample=Image.BICUBIC, expand=True)
-        if SS != 1:
-            rotated = rotated.resize(
-                (rotated.width // SS, rotated.height // SS), Image.LANCZOS
-            )
-
+        rotated = _finished_card(item, _load_photo_safely(item))
         px = int(round(item.center_x - rotated.width / 2))
         py = int(round(item.center_y - rotated.height / 2))
         sheet.paste(rotated, (px, py), rotated)
-
     return sheet
 
 
-def save_sheet(project: Project, path: str) -> None:
-    img = render_sheet(project)
+def render_card_export(item: PolaroidItem) -> Image.Image:
+    """Одна повёрнутая карточка на прозрачном фоне для отдельного экспорта."""
+    return _finished_card(item, _load_photo_safely(item))
+
+
+def _icc_kwargs() -> dict[str, bytes]:
+    profile = srgb_icc_profile()
+    return {"icc_profile": profile} if profile else {}
+
+
+def _save_image(img: Image.Image, path: str,
+                background: tuple[int, int, int] = (255, 255, 255)) -> None:
     ext = os.path.splitext(path)[1].lower()
     if ext in (".jpg", ".jpeg"):
-        img.save(path, "JPEG", quality=95, dpi=(DPI, DPI))
+        flat = img
+        if flat.mode in ("RGBA", "LA", "PA"):
+            base = Image.new("RGBA", flat.size, background + (255,))
+            base.alpha_composite(flat.convert("RGBA"))
+            flat = base.convert("RGB")
+        elif flat.mode != "RGB":
+            flat = flat.convert("RGB")
+        flat.save(path, "JPEG", quality=95, subsampling=0,
+                  dpi=(DPI, DPI), **_icc_kwargs())
+    elif ext == ".pdf":
+        flat = img
+        if flat.mode in ("RGBA", "LA", "PA"):
+            base = Image.new("RGBA", flat.size, background + (255,))
+            base.alpha_composite(flat.convert("RGBA"))
+            flat = base.convert("RGB")
+        elif flat.mode != "RGB":
+            flat = flat.convert("RGB")
+        flat.save(path, "PDF", resolution=float(DPI), **_icc_kwargs())
     else:
-        img.save(path, "PNG", dpi=(DPI, DPI))
+        img.save(path, "PNG", dpi=(DPI, DPI), **_icc_kwargs())
+
+
+def save_sheet(project: Project, path: str) -> None:
+    _save_image(render_sheet(project), path, project.background_rgb)
+
+
+def save_card(item: PolaroidItem, path: str,
+              background: tuple[int, int, int] = (255, 255, 255)) -> None:
+    _save_image(render_card_export(item), path, background)

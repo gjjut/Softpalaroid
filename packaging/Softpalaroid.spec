@@ -12,14 +12,17 @@ ROOT = os.path.dirname(SPECPATH)
 
 # pillow-heif: нативный модуль и DLL libheif/libde265 должны попасть в сборку,
 # иначе HEIC/HEIF не откроются именно в .exe (в исходниках всё работает).
+# rawpy/LibRaw загружается лениво внутри image_io, поэтому его тоже явно
+# собираем вместе с динамическими библиотеками.
 heif_binaries = collect_dynamic_libs("pillow_heif")
+rawpy_binaries = collect_dynamic_libs("rawpy")
 
 a = Analysis(
     [os.path.join(ROOT, "run.py")],
     pathex=[os.path.join(ROOT, "src"), ROOT],
-    binaries=heif_binaries,
+    binaries=heif_binaries + rawpy_binaries,
     datas=[(os.path.join(ROOT, "assets"), "assets")],
-    hiddenimports=["pillow_heif", "_pillow_heif"],
+    hiddenimports=["pillow_heif", "_pillow_heif", "rawpy"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

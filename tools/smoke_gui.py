@@ -13,7 +13,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from PIL import Image, ImageDraw  # noqa: E402
-from PySide6.QtGui import QFontDatabase  # noqa: E402
+from PySide6.QtGui import QFontDatabase, QImage  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from softpalaroid.main_window import IMAGE_FILTER, MainWindow  # noqa: E402
@@ -36,6 +36,7 @@ def main() -> None:
     assert any(f.startswith("Inter") for f in families), "Inter font not registered"
     assert any(f.startswith("Caveat") for f in families), "Caveat font not registered"
     assert "*.jfif" in IMAGE_FILTER and "*.heic" in IMAGE_FILTER, IMAGE_FILTER
+    assert "*.dng" in IMAGE_FILTER and "*.cr2" in IMAGE_FILTER, IMAGE_FILTER
     win = MainWindow()
     win._skip_unsaved_prompt = True  # noqa: SLF001 - headless-тест без диалогов
     win.show()
@@ -65,11 +66,58 @@ def main() -> None:
             item.filter = "vintage"
             win.canvas.refresh_item_pixmap(i)
 
+        _stage("paper / card format / template / safe area")
+        paper_idx = win.paper_combo.findData("a4")
+        assert paper_idx >= 0
+        win.paper_combo.setCurrentIndex(paper_idx)
+        assert win.project.paper_size == "a4"
+        assert (win.project.sheet_w, win.project.sheet_h) == (2480, 3508)
+        format_idx = win.card_format_combo.findData("instax_wide")
+        assert format_idx >= 0
+        win.card_format_combo.setCurrentIndex(format_idx)
+        assert win.project.card_format == "instax_wide"
+        assert all(item.card_format == "instax_wide"
+                   for item in win.project.items)
+        template_idx = win.template_combo.findData("warm_film")
+        assert template_idx >= 0
+        win.template_combo.setCurrentIndex(template_idx)
+        win._apply_template()  # noqa: SLF001
+        assert win.project.template == "warm_film"
+        win.safe_margin_spin.setValue(8.5)
+        win.show_safe_button.setChecked(False)
+        win.snap_button.setChecked(False)
+        assert win.project.safe_margin_mm == 8.5
+        assert not win.project.show_safe_area
+        assert not win.project.snap_enabled
+
         win.canvas.select(0)
         win._set_background_color("#f6efe5")  # noqa: SLF001
         win._set_frame_color("#fff2cf")  # noqa: SLF001
         win._rotate_photo(90)  # noqa: SLF001
         assert win.project.cut_marks
+        win._set_item(  # noqa: SLF001
+            caption="Лето\n2026",
+            filter_intensity=0.65,
+            brightness=1.12,
+            contrast=1.05,
+            saturation=1.08,
+            sharpness=1.15,
+            caption_scale=1.2,
+            caption_color="#203040",
+            caption_align="left",
+        )
+        win._copy_card_style()  # noqa: SLF001
+        win.canvas.select(2)
+        win._paste_card_style()  # noqa: SLF001
+        assert win.project.items[2].brightness == 1.12
+        assert win.project.items[2].caption_color == "#203040"
+
+        clipboard_image = QImage(320, 240, QImage.Format.Format_RGB32)
+        clipboard_image.fill(0xFF336699)
+        app.clipboard().setImage(clipboard_image)
+        win._paste_photo_from_clipboard(1)  # noqa: SLF001
+        assert win.project.items[1].photo_size == (320, 240)
+        win.canvas.select(0)
 
         _stage("photos loaded, grab canvas")
         app.processEvents()
@@ -93,7 +141,28 @@ def main() -> None:
         assert win.project.background_color == "#f6efe5"
         assert win.project.items[0].frame_color == "#fff2cf"
         assert win.project.items[0].photo_rotation == 90
+        assert win.project.paper_size == "a4"
+        assert win.project.sheet_size_cm == (21.0, 29.7)
+        assert win.project.card_format == "instax_wide"
+        assert win.project.template == "warm_film"
+        assert win.project.safe_margin_mm == 8.5
+        assert not win.project.show_safe_area
+        assert not win.project.snap_enabled
+        assert win.project.items[0].caption == "Лето\n2026"
+        assert win.project.items[0].brightness == 1.12
+        assert win.project.items[0].caption_align == "left"
+        assert win.project.items[1].photo_size == (320, 240)
+        assert "Проверка макета" in win.preflight_label.text()
         assert not win._is_dirty()  # noqa: SLF001
+
+        _stage("return to classic 10x15 for final export")
+        paper_idx = win.paper_combo.findData("10x15")
+        assert paper_idx >= 0
+        win.paper_combo.setCurrentIndex(paper_idx)
+        format_idx = win.card_format_combo.findData("classic")
+        assert format_idx >= 0
+        win.card_format_combo.setCurrentIndex(format_idx)
+        assert (win.project.sheet_w, win.project.sheet_h) == (1181, 1772)
 
         _stage("free cards add/duplicate/delete/layer")
         win._add_card()  # noqa: SLF001
@@ -117,6 +186,10 @@ def main() -> None:
             result.load()
             assert result.size == (1181, 1772), result.size
             assert result.info.get("dpi") == (300, 300), result.info.get("dpi")
+        pdf_out = os.path.join(tmp, "sheet.pdf")
+        save_sheet(win.project, pdf_out)
+        with open(pdf_out, "rb") as pdf_file:
+            assert pdf_file.read(4) == b"%PDF"
         _stage("export verified")
 
     win.close()

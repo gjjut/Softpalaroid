@@ -7,7 +7,16 @@ import tempfile
 from datetime import datetime
 
 from PIL import UnidentifiedImageError
-from PySide6.QtCore import QRect, QSettings, QSize, QSizeF, QStandardPaths, QTimer, Qt
+from PySide6.QtCore import (
+    QRect,
+    QRectF,
+    QSettings,
+    QSize,
+    QSizeF,
+    QStandardPaths,
+    QTimer,
+    Qt,
+)
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -16,15 +25,17 @@ from PySide6.QtGui import (
     QDropEvent,
     QImage,
     QKeySequence,
+    QPageSize,
     QPainter,
     QPixmap,
 )
-from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+from PySide6.QtPrintSupport import QPrintPreviewDialog, QPrinter
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QColorDialog,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -35,6 +46,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -47,8 +60,18 @@ from PySide6.QtWidgets import (
 
 from . import __version__
 from .canvas import CanvasWidget
+from .batch import BatchOptions, export_batch
+from .dialogs import BatchDialog, PreflightDialog
 from .filters import FILTERS
-from .model import MAX_CARDS, PX_PER_CM, PolaroidItem, Project
+from .model import (
+    CARD_FORMATS,
+    MAX_CARDS,
+    PAPER_LABELS,
+    PAPER_SIZES,
+    PX_PER_CM,
+    PolaroidItem,
+    Project,
+)
 from .project_io import (
     PROJECT_EXTENSION,
     PROJECT_FILE_FILTER,
@@ -57,8 +80,14 @@ from .project_io import (
     project_state_key,
     save_project_file,
 )
-from .image_io import image_file_filter, is_supported_image_file, load_photo
-from .render import render_sheet, save_sheet
+from .image_io import (
+    image_file_filter,
+    is_supported_image_file,
+    probe_image_size,
+)
+from .preflight import analyze_project, issue_counts
+from .render import render_sheet, save_card, save_sheet
+from .templates import DESIGN_TEMPLATES, apply_design_template
 from .resources import asset_path
 
 IMAGE_FILTER = image_file_filter()
@@ -71,7 +100,7 @@ AUTOSAVE_FILENAME = "autosave.softpalaroid"
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Softpalaroid — полароиды на листе 10×15")
+        self.setWindowTitle("Softpalaroid — полароидные карточки для печати")
         self.resize(1260, 820)
         self.setMinimumSize(1000, 640)
         self.setAcceptDrops(True)
@@ -91,6 +120,8 @@ class MainWindow(QMainWindow):
         self._skip_unsaved_prompt = False
         self._recent_menus: list[QMenu] = []
         self._subtitle_label: QLabel | None = None
+        self._style_clipboard: dict | None = None
+        self._adjustment_controls: dict[str, tuple[QSlider, QDoubleSpinBox, int]] = {}
 
         self._history_timer = QTimer(self)
         self._history_timer.setSingleShot(True)
@@ -110,6 +141,8 @@ class MainWindow(QMainWindow):
         self.canvas.photoLoadRequested.connect(self._load_photo_dialog)
         self.canvas.deleteRequested.connect(lambda _i: self._delete_card())
         self.canvas.duplicateRequested.connect(lambda _i: self._duplicate_card())
+        self.canvas.pasteRequested.connect(self._paste_photo_from_clipboard)
+        self.canvas.contextMenuRequested.connect(self._show_canvas_context_menu)
         self.canvas.editStarted.connect(self._begin_canvas_edit)
         self.canvas.editFinished.connect(self._finish_canvas_edit)
 
@@ -128,7 +161,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 1)
         splitter.setHandleWidth(1)
         splitter.setChildrenCollapsible(False)
-        splitter.setSizes([900, 360])
+        splitter.setSizes([856, 404])
         root.addWidget(splitter, 1)
         self.setCentralWidget(central)
 
@@ -164,13 +197,22 @@ class MainWindow(QMainWindow):
         self.act_open.triggered.connect(
             lambda: self._load_photo_dialog(self._selected_index()))
 
-        self.act_export = QAction("Экспорт листа JPG/PNG…", self)
+        self.act_export = QAction("Экспорт листа JPG/PNG/PDF…", self)
         self.act_export.setShortcut("Ctrl+E")
         self.act_export.triggered.connect(self._export_dialog)
 
-        self.act_print = QAction("Печать…", self)
+        self.act_print = QAction("Предпросмотр и печать…", self)
         self.act_print.setShortcut("Ctrl+P")
         self.act_print.triggered.connect(self._print_dialog)
+
+        self.act_preflight = QAction("Проверить макет", self)
+        self.act_preflight.setShortcut("Ctrl+Shift+P")
+        self.act_preflight.triggered.connect(
+            lambda: self._confirm_preflight("Закрыть", manual=True))
+
+        self.act_batch = QAction("Пакетная обработка…", self)
+        self.act_batch.setShortcut("Ctrl+Shift+B")
+        self.act_batch.triggered.connect(self._batch_dialog)
 
         self.act_undo = QAction("Отменить", self)
         self.act_undo.setShortcut("Ctrl+Z")
@@ -194,6 +236,7 @@ class MainWindow(QMainWindow):
             self.act_new_project, self.act_open_project,
             self.act_save_project, self.act_save_project_as,
             self.act_open, self.act_export, self.act_print,
+            self.act_preflight, self.act_batch,
             self.act_undo, self.act_redo, self.act_about, self.act_quit,
         ])
 
@@ -281,7 +324,7 @@ class MainWindow(QMainWindow):
         titles.setSpacing(0)
         title = QLabel("Softpalaroid")
         title.setObjectName("appTitle")
-        subtitle = QLabel("Новый проект · лист 10×15")
+        subtitle = QLabel("Новый проект · лист 15×10 см")
         subtitle.setObjectName("appSubtitle")
         self._subtitle_label = subtitle
         titles.addWidget(title)
@@ -349,7 +392,10 @@ class MainWindow(QMainWindow):
         menu.addActions([self.act_undo, self.act_redo])
         menu.addSeparator()
         menu.addMenu(self._make_project_menu(menu))
-        menu.addActions([self.act_open, self.act_export, self.act_print])
+        menu.addActions([
+            self.act_open, self.act_export, self.act_print,
+            self.act_preflight, self.act_batch,
+        ])
         menu.addSeparator()
         menu.addAction(self.act_about)
         menu.addSeparator()
@@ -434,6 +480,33 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         return wrap
 
+    def _make_adjustment_row(self, layout: QVBoxLayout, text: str,
+                             field_name: str, minimum: float,
+                             maximum: float) -> None:
+        """Добавить пару слайдер+спинбокс для числового поля карточки."""
+        layout.addWidget(self._field_label(text))
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        scale = 100
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(int(round(minimum * scale)), int(round(maximum * scale)))
+        slider.valueChanged.connect(
+            lambda value, f=field_name, sc=scale:
+            self._set_item(**{f: value / sc}))
+        spin = QDoubleSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setDecimals(2)
+        spin.setSingleStep(0.05)
+        spin.setSuffix("×")
+        spin.setFixedWidth(88)
+        spin.setMinimumHeight(34)
+        spin.valueChanged.connect(
+            lambda value, f=field_name: self._set_item(**{f: value}))
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        layout.addLayout(row)
+        self._adjustment_controls[field_name] = (slider, spin, scale)
+
     def _build_panel(self) -> QWidget:
         inner = QWidget()
         lay = QVBoxLayout(inner)
@@ -441,7 +514,72 @@ class MainWindow(QMainWindow):
         lay.setSpacing(14)
 
         # --- Лист ---
-        sheet_card, gl = self._card("Лист 10×15")
+        sheet_card, gl = self._card("Лист и форматы")
+        gl.addWidget(self._field_label("Размер бумаги"))
+        self.paper_combo = QComboBox()
+        self.paper_combo.setMinimumHeight(38)
+        for key in PAPER_SIZES:
+            self.paper_combo.addItem(PAPER_LABELS[key], key)
+        self.paper_combo.addItem(PAPER_LABELS["custom"], "custom")
+        paper_idx = self.paper_combo.findData(self.project.paper_size)
+        if paper_idx >= 0:
+            self.paper_combo.setCurrentIndex(paper_idx)
+        self.paper_combo.currentIndexChanged.connect(
+            lambda _idx: self._paper_changed())
+        gl.addWidget(self.paper_combo)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(self._field_label("Ш"))
+        self.sheet_width_spin = QDoubleSpinBox()
+        self.sheet_width_spin.setRange(5.0, 50.0)
+        self.sheet_width_spin.setDecimals(1)
+        self.sheet_width_spin.setSingleStep(0.1)
+        self.sheet_width_spin.setSuffix(" см")
+        self.sheet_width_spin.setMinimumHeight(36)
+        self.sheet_width_spin.setValue(self.project.sheet_width_cm)
+        self.sheet_width_spin.valueChanged.connect(
+            lambda _v: self._custom_sheet_changed())
+        row.addWidget(self.sheet_width_spin, 1)
+        row.addWidget(QLabel("×"))
+        row.addWidget(self._field_label("В"))
+        self.sheet_height_spin = QDoubleSpinBox()
+        self.sheet_height_spin.setRange(5.0, 50.0)
+        self.sheet_height_spin.setDecimals(1)
+        self.sheet_height_spin.setSingleStep(0.1)
+        self.sheet_height_spin.setSuffix(" см")
+        self.sheet_height_spin.setMinimumHeight(36)
+        self.sheet_height_spin.setValue(self.project.sheet_height_cm)
+        self.sheet_height_spin.valueChanged.connect(
+            lambda _v: self._custom_sheet_changed())
+        row.addWidget(self.sheet_height_spin, 1)
+        gl.addLayout(row)
+
+        gl.addWidget(self._field_label("Формат карточек"))
+        self.card_format_combo = QComboBox()
+        self.card_format_combo.setMinimumHeight(38)
+        for spec in CARD_FORMATS.values():
+            self.card_format_combo.addItem(spec.name, spec.key)
+        format_idx = self.card_format_combo.findData(self.project.card_format)
+        if format_idx >= 0:
+            self.card_format_combo.setCurrentIndex(format_idx)
+        self.card_format_combo.currentIndexChanged.connect(
+            lambda _idx: self._card_format_changed())
+        gl.addWidget(self.card_format_combo)
+
+        gl.addWidget(self._field_label("Дизайн-шаблон"))
+        self.template_combo = QComboBox()
+        self.template_combo.setMinimumHeight(38)
+        for template in DESIGN_TEMPLATES.values():
+            self.template_combo.addItem(template.name, template.key)
+        template_idx = self.template_combo.findData(self.project.template)
+        if template_idx >= 0:
+            self.template_combo.setCurrentIndex(template_idx)
+        gl.addWidget(self.template_combo)
+        btn_template = self._ghost_button("Применить шаблон ко всему листу", 34)
+        btn_template.clicked.connect(self._apply_template)
+        gl.addWidget(btn_template)
+
         gl.addWidget(self._field_label("Ориентация"))
         self.orientation_group = QButtonGroup(self)
         self.rb_land = self._segment_button("Альбомная")
@@ -512,6 +650,35 @@ class MainWindow(QMainWindow):
             lambda checked: self._set_project_setting(cut_marks=checked))
         gl.addWidget(self.cut_marks_button)
 
+        gl.addWidget(self._field_label("Безопасная область от края"))
+        self.safe_margin_spin = QDoubleSpinBox()
+        self.safe_margin_spin.setRange(0.0, 25.0)
+        self.safe_margin_spin.setDecimals(1)
+        self.safe_margin_spin.setSingleStep(0.5)
+        self.safe_margin_spin.setSuffix(" мм")
+        self.safe_margin_spin.setMinimumHeight(36)
+        self.safe_margin_spin.setValue(self.project.safe_margin_mm)
+        self.safe_margin_spin.valueChanged.connect(
+            lambda value: self._set_project_setting(safe_margin_mm=value))
+        gl.addWidget(self.safe_margin_spin)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.show_safe_button = self._segment_button("Показывать область")
+        self.show_safe_button.setChecked(self.project.show_safe_area)
+        self.show_safe_button.toggled.connect(
+            lambda checked: self._set_project_setting(show_safe_area=checked))
+        row.addWidget(self.show_safe_button, 1)
+        self.snap_button = self._segment_button("Магниты")
+        self.snap_button.setChecked(self.project.snap_enabled)
+        self.snap_button.setToolTip(
+            "Притягивать карточки к краям, центру, безопасной области и соседям; "
+            "Alt временно отключает магниты")
+        self.snap_button.toggled.connect(
+            lambda checked: self._set_project_setting(snap_enabled=checked))
+        row.addWidget(self.snap_button, 1)
+        gl.addLayout(row)
+
         gl.addWidget(self._field_label("Фон листа"))
         self.background_button = self._color_button()
         self.background_button.clicked.connect(self._choose_background_color)
@@ -531,6 +698,10 @@ class MainWindow(QMainWindow):
         row.addWidget(self.slot_label)
         row.addWidget(self.slot_state, 1)
         il.addLayout(row)
+        self.dpi_label = QLabel()
+        self.dpi_label.setProperty("role", "muted")
+        self.dpi_label.setWordWrap(True)
+        il.addWidget(self.dpi_label)
 
         btn_load = QPushButton("+  Загрузить фото")
         btn_load.setObjectName("whiteButton")
@@ -543,15 +714,27 @@ class MainWindow(QMainWindow):
         btn_dup.clicked.connect(self._duplicate_to_all)
         il.addWidget(btn_dup)
 
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        btn_paste = self._ghost_button("Вставить из буфера", 34)
+        btn_paste.clicked.connect(
+            lambda: self._paste_photo_from_clipboard(self._selected_index()))
+        row.addWidget(btn_paste, 1)
+        btn_export_card = self._ghost_button("Экспорт карточки…", 34)
+        btn_export_card.clicked.connect(
+            lambda: self._export_card_dialog(self._selected_index()))
+        row.addWidget(btn_export_card, 1)
+        il.addLayout(row)
+
         il.addWidget(self._field_label("Размер карточки"))
         row = QHBoxLayout()
         row.setSpacing(10)
         self.card_size_slider = QSlider(Qt.Orientation.Horizontal)
-        self.card_size_slider.setRange(20, 95)  # десятые сантиметра
+        self.card_size_slider.setRange(18, 250)  # десятые сантиметра
         self.card_size_slider.valueChanged.connect(
             lambda v: self._set_item(width=v / 10.0 * PX_PER_CM))
         self.card_size_spin = QDoubleSpinBox()
-        self.card_size_spin.setRange(2.0, 9.5)
+        self.card_size_spin.setRange(1.8, 25.0)
         self.card_size_spin.setDecimals(1)
         self.card_size_spin.setSingleStep(0.1)
         self.card_size_spin.setSuffix(" см")
@@ -648,13 +831,39 @@ class MainWindow(QMainWindow):
         il.addWidget(self.photo_transform_label)
 
         il.addWidget(self._field_label("Подпись на рамке"))
-        self.caption_edit = QLineEdit()
+        self.caption_edit = QPlainTextEdit()
         self.caption_edit.setPlaceholderText("лето 2026")
-        self.caption_edit.setMaxLength(40)
-        self.caption_edit.setMinimumHeight(40)
+        self.caption_edit.setFixedHeight(58)
+        self.caption_edit.setTabChangesFocus(True)
         self.caption_edit.textChanged.connect(
-            lambda t: self._set_item(caption=t, refresh_pixmap=False))
+            lambda: self._set_item(
+                caption=self.caption_edit.toPlainText()[:120],
+                refresh_pixmap=False))
         il.addWidget(self.caption_edit)
+
+        il.addWidget(self._field_label("Выравнивание подписи"))
+        self.caption_align_combo = QComboBox()
+        self.caption_align_combo.setMinimumHeight(36)
+        self.caption_align_combo.addItem("Слева", "left")
+        self.caption_align_combo.addItem("По центру", "center")
+        self.caption_align_combo.addItem("Справа", "right")
+        self.caption_align_combo.setCurrentIndex(1)
+        self.caption_align_combo.currentIndexChanged.connect(
+            lambda _idx: self._set_item(
+                caption_align=self.caption_align_combo.currentData(),
+                refresh_pixmap=False))
+        il.addWidget(self.caption_align_combo)
+        self._make_adjustment_row(
+            il, "Размер подписи", "caption_scale", 0.6, 1.6)
+
+        il.addWidget(self._field_label("Цвет подписи"))
+        self.caption_color_button = self._color_button()
+        self.caption_color_button.clicked.connect(self._choose_caption_color)
+        il.addWidget(self.caption_color_button)
+        btn_caption_auto = self._ghost_button("Цвет подписи — автоматически", 34)
+        btn_caption_auto.clicked.connect(
+            lambda: self._set_item(caption_color=None, refresh_pixmap=False))
+        il.addWidget(btn_caption_auto)
 
         il.addWidget(self._field_label("Фильтр в стиле плёнки"))
         self.filter_combo = QComboBox()
@@ -665,6 +874,12 @@ class MainWindow(QMainWindow):
         self.filter_combo.currentIndexChanged.connect(
             lambda: self._set_item(filter=self.filter_combo.currentData()))
         il.addWidget(self.filter_combo)
+        self._make_adjustment_row(
+            il, "Сила фильтра", "filter_intensity", 0.0, 1.0)
+        self._make_adjustment_row(il, "Яркость", "brightness", 0.4, 1.8)
+        self._make_adjustment_row(il, "Контраст", "contrast", 0.4, 1.8)
+        self._make_adjustment_row(il, "Насыщенность", "saturation", 0.0, 2.0)
+        self._make_adjustment_row(il, "Резкость", "sharpness", 0.0, 2.5)
 
         il.addWidget(self._field_label("Цвет рамки карточки"))
         self.frame_color_button = self._color_button()
@@ -675,6 +890,16 @@ class MainWindow(QMainWindow):
         btn_frame_all = self._ghost_button("Этот цвет рамки — всем карточкам", 34)
         btn_frame_all.clicked.connect(self._apply_frame_color_to_all)
         il.addWidget(btn_frame_all)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        btn_copy_style = self._ghost_button("Копир. стиль", 34)
+        btn_copy_style.clicked.connect(self._copy_card_style)
+        row.addWidget(btn_copy_style, 1)
+        btn_paste_style = self._ghost_button("Встав. стиль", 34)
+        btn_paste_style.clicked.connect(self._paste_card_style)
+        row.addWidget(btn_paste_style, 1)
+        il.addLayout(row)
         lay.addWidget(item_card)
 
         # --- Готово ---
@@ -683,15 +908,26 @@ class MainWindow(QMainWindow):
         self.size_label.setProperty("role", "muted")
         self.size_label.setWordWrap(True)
         ol.addWidget(self.size_label)
-        btn_save = QPushButton("Сохранить JPG/PNG · 300 DPI")
+        self.preflight_label = QLabel()
+        self.preflight_label.setProperty("role", "muted")
+        self.preflight_label.setWordWrap(True)
+        ol.addWidget(self.preflight_label)
+        btn_check = self._ghost_button("Проверить макет перед печатью", 38)
+        btn_check.clicked.connect(
+            lambda: self._confirm_preflight("Закрыть", manual=True))
+        ol.addWidget(btn_check)
+        btn_save = QPushButton("Сохранить JPG/PNG/PDF · 300 DPI")
         btn_save.setObjectName("primaryButton")
         btn_save.setMinimumHeight(44)
         btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save.clicked.connect(self._export_dialog)
         ol.addWidget(btn_save)
-        btn_print = self._ghost_button("Печать 10×15", 38)
-        btn_print.clicked.connect(self._print_dialog)
-        ol.addWidget(btn_print)
+        self.print_button = self._ghost_button("Предпросмотр и печать", 38)
+        self.print_button.clicked.connect(self._print_dialog)
+        ol.addWidget(self.print_button)
+        btn_batch = self._ghost_button("Пакетная обработка фотографий…", 38)
+        btn_batch.clicked.connect(self._batch_dialog)
+        ol.addWidget(btn_batch)
         lay.addWidget(out_card)
 
         # --- Подсказки ---
@@ -703,6 +939,10 @@ class MainWindow(QMainWindow):
             "Тянуть фото — сдвиг в рамке\n"
             "Тянуть рамку — двигать карточку\n"
             "Ручка сверху / Alt + тянуть — наклон\n"
+            "Квадратная ручка — размер карточки\n"
+            "Магниты помогают выровнять карточки; Alt отключает их\n"
+            "Правый клик — действия с карточкой\n"
+            "Ctrl+V на холсте — фото из буфера обмена\n"
             "Двойной клик — загрузить фото\n"
             "Стрелки — точный сдвиг фото\n"
             "Delete — удалить карточку, Ctrl+D — дублировать\n\n"
@@ -718,7 +958,7 @@ class MainWindow(QMainWindow):
         scroll.setObjectName("inspector")
         scroll.setWidget(inner)
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(356)
+        scroll.setFixedWidth(404)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         return scroll
@@ -737,7 +977,9 @@ class MainWindow(QMainWindow):
             setattr(item, name, value)
         item.clamp()
         if refresh_pixmap and fields.keys() & {
-                "filter", "photo_rotation", "flip_horizontal", "flip_vertical"}:
+                "filter", "filter_intensity", "brightness", "contrast",
+                "saturation", "sharpness", "photo_rotation",
+                "flip_horizontal", "flip_vertical"}:
             self.canvas.refresh_item_pixmap(self._selected_index())
         self.canvas.update()
         self._sync_panel(from_item=True)
@@ -768,13 +1010,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(
             f"Softpalaroid — {name}{' *' if dirty else ''}")
         if self._subtitle_label is not None:
+            sheet_label = self.project.sheet_label
             if self._project_path:
                 state = "не сохранено" if dirty else "сохранено"
-                self._subtitle_label.setText(f"{name} · {state} · лист 10×15")
+                self._subtitle_label.setText(
+                    f"{name} · {state} · лист {sheet_label}")
             elif dirty:
-                self._subtitle_label.setText("Новый проект · не сохранено · лист 10×15")
+                self._subtitle_label.setText(
+                    f"Новый проект · не сохранено · лист {sheet_label}")
             else:
-                self._subtitle_label.setText("Новый проект · лист 10×15")
+                self._subtitle_label.setText(f"Новый проект · лист {sheet_label}")
 
     def _update_history_actions(self) -> None:
         can_undo = bool(self._undo_stack or self._pending_before)
@@ -850,6 +1095,9 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "rb_land"):
             return
         controls = [
+            self.paper_combo, self.sheet_width_spin, self.sheet_height_spin,
+            self.card_format_combo, self.template_combo,
+            self.safe_margin_spin, self.show_safe_button, self.snap_button,
             self.rb_land, self.rb_port, self.count_spin,
             *self.count_buttons.values(), self.cut_marks_button,
         ]
@@ -858,6 +1106,23 @@ class MainWindow(QMainWindow):
         # эксклюзивная QButtonGroup не даёт программно снять все отметки.
         self.count_group.setExclusive(False)
         try:
+            paper_idx = self.paper_combo.findData(self.project.paper_size)
+            if paper_idx >= 0:
+                self.paper_combo.setCurrentIndex(paper_idx)
+            self.sheet_width_spin.setValue(self.project.sheet_width_cm)
+            self.sheet_height_spin.setValue(self.project.sheet_height_cm)
+            is_custom_paper = self.project.paper_size == "custom"
+            self.sheet_width_spin.setEnabled(is_custom_paper)
+            self.sheet_height_spin.setEnabled(is_custom_paper)
+            format_idx = self.card_format_combo.findData(self.project.card_format)
+            if format_idx >= 0:
+                self.card_format_combo.setCurrentIndex(format_idx)
+            template_idx = self.template_combo.findData(self.project.template)
+            if template_idx >= 0:
+                self.template_combo.setCurrentIndex(template_idx)
+            self.safe_margin_spin.setValue(self.project.safe_margin_mm)
+            self.show_safe_button.setChecked(self.project.show_safe_area)
+            self.snap_button.setChecked(self.project.snap_enabled)
             self.rb_land.setChecked(self.project.landscape)
             self.rb_port.setChecked(not self.project.landscape)
             count = len(self.project.items)
@@ -882,10 +1147,14 @@ class MainWindow(QMainWindow):
         self._applying_state = True
         self._history_timer.stop()
         try:
-            self.project.landscape = project.landscape
-            self.project.background_color = project.background_color
-            self.project.cut_marks = project.cut_marks
-            self.project.items = copy.deepcopy(project.items)
+            # Один и тот же объект Project уже привязан к Canvas: заменяем
+            # целиком его словарь полей, включая все новые настройки.
+            new_state = copy.deepcopy(project)
+            self.project.__dict__.clear()
+            self.project.__dict__.update(new_state.__dict__)
+            self.project.clamp_settings()
+            for state_item in self.project.items:
+                state_item.clamp()
             if self.project.items:
                 self.canvas.selected = max(
                     0, min(len(self.project.items) - 1, selected))
@@ -1155,17 +1424,49 @@ class MainWindow(QMainWindow):
         self.slot_label.setText(
             f"Слот {self._selected_index() + 1} / {len(self.project.items)}")
         self.slot_state.setText("Фото загружено" if item.photo_path else "Без фото")
-        w_cm, h_cm = (15, 10) if self.project.landscape else (10, 15)
         self.size_label.setText(
             f"Файл: {self.project.sheet_w}×{self.project.sheet_h} px\n"
-            f"Печать: {w_cm}×{h_cm} см при 300 DPI")
+            f"Печать: {self.project.sheet_label} при 300 DPI")
+        self.print_button.setText(
+            f"Предпросмотр и печать {self.project.sheet_label}")
 
-        widgets = (
+        if item.photo_path and item.photo_size:
+            self.slot_state.setText(
+                f"Фото: {item.photo_size[0]}×{item.photo_size[1]} px")
+            dpi = item.effective_print_dpi()
+            if dpi is None:
+                self.dpi_label.setText("Разрешение печати: не определено")
+            elif dpi >= 300:
+                self.dpi_label.setText(
+                    f"✓ {dpi:.0f} DPI после кадрирования — отлично для печати")
+            elif dpi >= 180:
+                self.dpi_label.setText(
+                    f"⚠ {dpi:.0f} DPI после кадрирования — ниже 300 DPI")
+            else:
+                self.dpi_label.setText(
+                    f"⚠ {dpi:.0f} DPI после кадрирования — низкое разрешение")
+        elif item.photo_path:
+            self.dpi_label.setText("Разрешение печати: размер фото не определён")
+        else:
+            self.dpi_label.setText("Разрешение печати: нет фотографии")
+
+        issues = analyze_project(self.project)
+        if issues:
+            warning_count, info_count = issue_counts(issues)
+            self.preflight_label.setText(
+                f"Проверка макета: {warning_count} предупреждений, "
+                f"{info_count} замечаний")
+        else:
+            self.preflight_label.setText("✓ Проверка макета: замечаний нет")
+
+        widgets = [
             self.rot_slider, self.rot_spin, self.zoom_slider, self.zoom_spin,
             self.card_size_slider, self.card_size_spin,
             self.flip_h_button, self.flip_v_button,
-            self.caption_edit, self.filter_combo,
-        )
+            self.caption_edit, self.caption_align_combo, self.filter_combo,
+        ]
+        for slider, spin, _scale in self._adjustment_controls.values():
+            widgets.extend([slider, spin])
         blockers = [w.blockSignals(True) for w in widgets]
         try:
             self.rot_slider.setValue(int(round(item.rotation * 10)))
@@ -1176,8 +1477,16 @@ class MainWindow(QMainWindow):
             self.card_size_spin.setValue(item.width_cm)
             self.flip_h_button.setChecked(item.flip_horizontal)
             self.flip_v_button.setChecked(item.flip_vertical)
-            if self.caption_edit.text() != item.caption:
-                self.caption_edit.setText(item.caption)
+            if self.caption_edit.toPlainText() != item.caption:
+                self.caption_edit.setPlainText(item.caption)
+            align_idx = self.caption_align_combo.findData(item.caption_align)
+            if align_idx >= 0:
+                self.caption_align_combo.setCurrentIndex(align_idx)
+            for field_name, (slider, spin, scale) in \
+                    self._adjustment_controls.items():
+                value = float(getattr(item, field_name))
+                slider.setValue(int(round(value * scale)))
+                spin.setValue(value)
             idx = self.filter_combo.findData(item.filter)
             if idx >= 0:
                 self.filter_combo.setCurrentIndex(idx)
@@ -1198,6 +1507,12 @@ class MainWindow(QMainWindow):
         self._style_color_button(
             self.frame_color_button, item.frame_color,
             f"Рамка: {item.frame_color.upper()}")
+        caption_hex = item.caption_color or ("#%02x%02x%02x" % item.caption_rgb)
+        caption_text = (
+            f"Подпись: {caption_hex.upper()}" if item.caption_color
+            else "Подпись: автоматически")
+        self._style_color_button(
+            self.caption_color_button, caption_hex, caption_text)
 
     # ------------------------------------------------------------- действия
     def _orientation_changed(self, _checked: bool) -> None:
@@ -1218,6 +1533,63 @@ class MainWindow(QMainWindow):
         self._sync_layout_controls()
         self._sync_panel()
         self._commit_change(before)
+
+    def _paper_changed(self) -> None:
+        paper = str(self.paper_combo.currentData() or "custom")
+        before = self._snapshot_state()
+        if paper == "custom":
+            self.project.paper_size = "custom"
+            self.project.clamp_settings()
+        else:
+            self.project.set_paper_size(
+                paper, landscape=self.project.landscape)
+            self.project.set_layout(
+                len(self.project.items), landscape=self.project.landscape)
+            self.canvas.reset_view()
+        self.canvas.on_layout_changed()
+        self._sync_layout_controls()
+        self._sync_panel()
+        self._commit_change(before)
+
+    def _custom_sheet_changed(self) -> None:
+        if str(self.paper_combo.currentData() or "") != "custom":
+            return
+        width = self.sheet_width_spin.value()
+        height = self.sheet_height_spin.value()
+        if abs(width - self.project.sheet_width_cm) < 0.001 and \
+                abs(height - self.project.sheet_height_cm) < 0.001:
+            return
+        before = self._snapshot_state()
+        self.project.set_sheet_dimensions(width, height, paper_size="custom")
+        self.project.set_layout(
+            len(self.project.items), landscape=self.project.landscape)
+        self.canvas.on_layout_changed()
+        self.canvas.reset_view()
+        self._sync_layout_controls()
+        self._sync_panel()
+        self._commit_change(before)
+
+    def _card_format_changed(self) -> None:
+        card_format = str(self.card_format_combo.currentData() or "classic")
+        if card_format == self.project.card_format:
+            return
+        before = self._snapshot_state()
+        self.project.set_card_format(card_format, relayout=True)
+        self.canvas.on_layout_changed()
+        self._sync_layout_controls()
+        self._sync_panel()
+        self._commit_change(before)
+
+    def _apply_template(self) -> None:
+        template_key = str(self.template_combo.currentData() or "classic")
+        before = self._snapshot_state()
+        template = apply_design_template(self.project, template_key)
+        self.canvas.refresh_all_pixmaps()
+        self._sync_layout_controls()
+        self._sync_panel()
+        self._commit_change(before)
+        self.statusBar().showMessage(
+            f"Применён шаблон «{template.name}»", 3500)
 
     def _reset_layout(self) -> None:
         before = self._snapshot_state()
@@ -1317,6 +1689,13 @@ class MainWindow(QMainWindow):
         if color:
             self._set_frame_color(color)
 
+    def _choose_caption_color(self) -> None:
+        item = self._item()
+        current = item.caption_color or ("#%02x%02x%02x" % item.caption_rgb)
+        color = self._pick_color(current, "Цвет подписи")
+        if color:
+            self._set_item(caption_color=color, refresh_pixmap=False)
+
     def _apply_frame_color_to_all(self) -> None:
         before = self._snapshot_state()
         color = self._item().frame_color
@@ -1330,10 +1709,16 @@ class MainWindow(QMainWindow):
     def _load_photo_dialog(self, slot: int) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Выберите одно или несколько фото", "", IMAGE_FILTER)
-        if not paths:
-            return
+        if paths:
+            self._load_photo_paths(paths, slot)
+
+    def _load_photo_paths(self, paths: list[str], start_slot: int = 0) -> int:
+        """Загрузить фото подряд, при необходимости добавляя карточки."""
+        if not paths or not self.project.items:
+            return 0
+        start_slot = max(0, min(len(self.project.items) - 1, int(start_slot)))
         before = self._snapshot_state()
-        current = slot
+        current = start_slot
         loaded = 0
         for path in paths:
             if current >= len(self.project.items):
@@ -1344,17 +1729,20 @@ class MainWindow(QMainWindow):
                 loaded += 1
                 current += 1
         if loaded:
-            self.canvas.selected = slot
+            self.canvas.selected = start_slot
             self.canvas.on_layout_changed()
             self._sync_layout_controls()
             self._sync_panel()
             self._commit_change(before)
+        return loaded
 
     def _load_photo_into(self, slot: int, path: str,
                          *, record_history: bool = True) -> bool:
         try:
-            size = load_photo(path).size
-        except (OSError, UnidentifiedImageError) as exc:
+            # Для RAW и огромных оригиналов не нужно декодировать весь кадр
+            # только ради размеров: превью Canvas загрузит отдельно.
+            size = probe_image_size(path)
+        except Exception as exc:  # noqa: BLE001 - все ошибки кодеков показываем в GUI
             QMessageBox.warning(self, "Не удалось открыть фото",
                                 f"{os.path.basename(path)}\n\n{exc}")
             return False
@@ -1388,30 +1776,202 @@ class MainWindow(QMainWindow):
             item.flip_horizontal = src.flip_horizontal
             item.flip_vertical = src.flip_vertical
             item.filter = src.filter
+            item.filter_intensity = src.filter_intensity
+            item.brightness = src.brightness
+            item.contrast = src.contrast
+            item.saturation = src.saturation
+            item.sharpness = src.sharpness
+            item.grain_seed = src.effective_grain_seed()
+            item.clamp()
             self.canvas.refresh_item_pixmap(i)
         self.canvas.update()
         self._commit_change(before)
 
-    def _warn_empty_slots(self) -> bool:
-        empty = [i + 1 for i, it in enumerate(self.project.items) if not it.photo_path]
-        if not empty:
-            return True
-        answer = QMessageBox.question(
-            self, "Есть пустые слоты",
-            f"Слоты без фото: {', '.join(map(str, empty))}. "
-            "На готовом листе они останутся серыми.\n\nПродолжить?")
-        return answer == QMessageBox.StandardButton.Yes
+    _STYLE_FIELDS = (
+        "frame_color", "filter", "filter_intensity", "brightness",
+        "contrast", "saturation", "sharpness", "caption_scale",
+        "caption_color", "caption_align",
+    )
 
-    def _export_dialog(self) -> None:
-        if not self._warn_empty_slots():
+    def _copy_card_style(self) -> None:
+        item = self._item()
+        self._style_clipboard = {
+            field_name: copy.deepcopy(getattr(item, field_name))
+            for field_name in self._STYLE_FIELDS
+        }
+        self.statusBar().showMessage(
+            f"Стиль карточки {self._selected_index() + 1} скопирован", 3000)
+
+    def _paste_card_style(self) -> None:
+        if not self._style_clipboard:
+            QMessageBox.information(
+                self, "Стиль не скопирован",
+                "Сначала скопируйте стиль другой карточки.")
             return
+        before = self._snapshot_state()
+        item = self._item()
+        for field_name, value in self._style_clipboard.items():
+            setattr(item, field_name, copy.deepcopy(value))
+        item.clamp()
+        self.canvas.refresh_item_pixmap(self._selected_index())
+        self.canvas.update()
+        self._sync_panel()
+        self._commit_change(before)
+        self.statusBar().showMessage("Стиль карточки вставлен", 3000)
+
+    def _paste_photo_from_clipboard(self, slot: int = -1) -> None:
+        target = self._selected_index() if slot < 0 else slot
+        clipboard = QApplication.clipboard()
+        mime = clipboard.mimeData()
+        if mime is not None and mime.hasUrls():
+            files = [path for url in mime.urls()
+                     if (path := url.toLocalFile())
+                     and is_supported_image_file(path)]
+            if files:
+                self._load_photo_paths(files, target)
+                return
+        if mime is not None and mime.hasImage():
+            image = clipboard.image()
+            if not image.isNull():
+                handle, path = tempfile.mkstemp(
+                    prefix="softpalaroid-clipboard-", suffix=".png")
+                os.close(handle)
+                if image.save(path, "PNG"):
+                    if self._load_photo_into(target, path):
+                        return
+                else:
+                    QMessageBox.warning(
+                        self, "Буфер обмена",
+                        "Не удалось сохранить изображение из буфера обмена.")
+                    return
+        if mime is not None and mime.hasText():
+            candidate = mime.text().strip().strip('"')
+            if candidate and os.path.isfile(candidate) \
+                    and is_supported_image_file(candidate):
+                self._load_photo_paths([candidate], target)
+                return
+        QMessageBox.information(
+            self, "Буфер обмена",
+            "В буфере обмена нет изображения или файла фотографии.")
+
+    def _export_card_dialog(self, index: int = -1) -> None:
+        if not self.project.items:
+            return
+        if 0 <= index < len(self.project.items):
+            self.canvas.select(index)
+        item = self._item()
         path, selected_filter = QFileDialog.getSaveFileName(
-            self, "Сохранить лист 10×15", "polaroid_10x15.jpg",
-            "JPEG — для печати (*.jpg);;PNG (*.png)")
+            self, "Сохранить отдельную карточку",
+            f"polaroid_card_{self._selected_index() + 1}.png",
+            "PNG с прозрачным фоном (*.png);;JPEG (*.jpg);;PDF (*.pdf)")
         if not path:
             return
         if not os.path.splitext(path)[1]:
-            path += ".png" if "PNG" in selected_filter else ".jpg"
+            if "JPEG" in selected_filter:
+                path += ".jpg"
+            elif "PDF" in selected_filter:
+                path += ".pdf"
+            else:
+                path += ".png"
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            save_card(item, path, background=self.project.background_rgb)
+        except Exception as exc:  # noqa: BLE001
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Ошибка сохранения", str(exc))
+            return
+        QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage(
+            f"Карточка сохранена: {os.path.basename(path)}", 5000)
+
+    def _show_canvas_context_menu(self, index: int, global_pos) -> None:
+        menu = QMenu(self)
+        if 0 <= index < len(self.project.items):
+            load_action = menu.addAction("Загрузить / заменить фото…")
+            load_action.triggered.connect(lambda: self._load_photo_dialog(index))
+            paste_action = menu.addAction("Вставить фото из буфера обмена")
+            paste_action.triggered.connect(
+                lambda: self._paste_photo_from_clipboard(index))
+            export_action = menu.addAction("Экспорт этой карточки…")
+            export_action.triggered.connect(
+                lambda: self._export_card_dialog(index))
+            menu.addSeparator()
+            copy_style_action = menu.addAction("Копировать стиль карточки")
+            copy_style_action.triggered.connect(self._copy_card_style)
+            paste_style_action = menu.addAction("Вставить стиль карточки")
+            paste_style_action.setEnabled(self._style_clipboard is not None)
+            paste_style_action.triggered.connect(self._paste_card_style)
+            menu.addSeparator()
+            duplicate_action = menu.addAction("Дублировать карточку")
+            duplicate_action.triggered.connect(self._duplicate_card)
+            front_action = menu.addAction("На передний план")
+            front_action.triggered.connect(
+                lambda: self._move_card_to_layer(front=True))
+            back_action = menu.addAction("На задний план")
+            back_action.triggered.connect(
+                lambda: self._move_card_to_layer(front=False))
+            center_action = menu.addAction("В центр листа")
+            center_action.triggered.connect(self._center_card_on_sheet)
+            menu.addSeparator()
+            delete_action = menu.addAction("Удалить карточку")
+            delete_action.triggered.connect(self._delete_card)
+        else:
+            add_action = menu.addAction("Добавить карточку")
+            add_action.triggered.connect(self._add_card)
+            paste_action = menu.addAction("Вставить фото из буфера обмена")
+            paste_action.triggered.connect(
+                lambda: self._paste_photo_from_clipboard(self._selected_index()))
+            check_action = menu.addAction("Проверить макет")
+            check_action.triggered.connect(
+                lambda: self._confirm_preflight("Закрыть", manual=True))
+            batch_action = menu.addAction("Пакетная обработка…")
+            batch_action.triggered.connect(self._batch_dialog)
+        menu.exec(global_pos)
+
+    def _confirm_preflight(self, continue_text: str = "Продолжить", *,
+                           manual: bool = False) -> bool:
+        """Показать замечания, но дать пользователю продолжить работу."""
+        issues = analyze_project(self.project)
+        if not issues:
+            if manual:
+                QMessageBox.information(
+                    self, "Проверка макета",
+                    "Замечаний нет: макет готов к экспорту и печати.")
+            return True
+        dialog = PreflightDialog(issues, self, continue_text=continue_text)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if dialog.navigation_index >= 0:
+            self.canvas.select(dialog.navigation_index)
+            self._sync_panel()
+            self.canvas.setFocus()
+            self.statusBar().showMessage(
+                f"Выбрана проблемная карточка {dialog.navigation_index + 1}",
+                3500)
+            return False
+        return accepted
+
+    def _warn_empty_slots(self) -> bool:
+        # Совместимое имя для старых вызовов: теперь проверяется весь макет.
+        return self._confirm_preflight("Продолжить")
+
+    def _export_dialog(self) -> None:
+        if not self._confirm_preflight("Продолжить экспорт"):
+            return
+        dims = (f"{self.project.sheet_width_cm:g}x"
+                f"{self.project.sheet_height_cm:g}").replace(".", "_")
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, f"Сохранить лист {self.project.sheet_label}",
+            f"polaroid_{dims}.jpg",
+            "JPEG — для печати (*.jpg);;PNG (*.png);;PDF для печати (*.pdf)")
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            if "PNG" in selected_filter:
+                path += ".png"
+            elif "PDF" in selected_filter:
+                path += ".pdf"
+            else:
+                path += ".jpg"
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             save_sheet(self.project, path)
@@ -1424,10 +1984,92 @@ class MainWindow(QMainWindow):
             self, "Готово",
             f"Лист сохранён:\n{path}\n\n"
             f"Размер: {self.project.sheet_w}×{self.project.sheet_h} px, 300 DPI — "
-            "можно печатать как фото 10×15.")
+            f"можно печатать как лист {self.project.sheet_label}.")
+
+    def _batch_dialog(self) -> None:
+        initial = BatchOptions(
+            cards_per_sheet=max(1, min(12, len(self.project.items) or 4)),
+            landscape=self.project.landscape,
+            paper_size=(self.project.paper_size
+                        if self.project.paper_size in PAPER_SIZES else "10x15"),
+            sheet_width_cm=self.project.sheet_width_cm,
+            sheet_height_cm=self.project.sheet_height_cm,
+            card_format=self.project.card_format,
+            template=(self.project.template
+                      if self.project.template in DESIGN_TEMPLATES else "classic"),
+            safe_margin_mm=self.project.safe_margin_mm,
+        )
+        saved_output = self._settings.value("batchOutputDir", "")
+        if not isinstance(saved_output, str) or not saved_output:
+            saved_output = QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.DocumentsLocation)
+        dialog = BatchDialog(self, initial=initial, output_dir=saved_output)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        output_dir = dialog.output_dir()
+        self._settings.setValue("batchOutputDir", output_dir)
+        self._settings.sync()
+
+        progress = QProgressDialog("Подготовка пакетной обработки…", "Отмена", 0, 1, self)
+        progress.setWindowTitle("Пакетная обработка")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+
+        def report(done: int, total: int, message: str) -> bool:
+            progress.setMaximum(max(1, total))
+            progress.setValue(done)
+            progress.setLabelText(message)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = export_batch(
+                dialog.photo_paths(), output_dir,
+                options=dialog.options(), progress=report)
+        finally:
+            QApplication.restoreOverrideCursor()
+            progress.close()
+
+        lines = [
+            f"Фотографий обработано: {result.photo_count}",
+            f"Листов сохранено: {result.sheet_count}",
+            f"Папка: {output_dir}",
+        ]
+        if result.errors:
+            lines.append("")
+            lines.append("Предупреждения:")
+            lines.extend(result.errors[:10])
+            if len(result.errors) > 10:
+                lines.append(f"…и ещё {len(result.errors) - 10}")
+        text = "\n".join(lines)
+        if result.output_files:
+            QMessageBox.information(self, "Пакетная обработка завершена", text)
+        else:
+            QMessageBox.warning(self, "Пакетная обработка", text)
+        self.statusBar().showMessage(
+            f"Пакетно сохранено листов: {result.sheet_count}", 5000)
+
+    @staticmethod
+    def _draw_image_to_printer(printer: QPrinter, image: QImage) -> None:
+        painter = QPainter(printer)
+        try:
+            page_rect = QRectF(printer.pageRect(QPrinter.Unit.DevicePixel))
+            scaled = QSizeF(image.size()).scaled(
+                page_rect.size(), Qt.AspectRatioMode.KeepAspectRatio)
+            target = QRectF(
+                page_rect.x() + (page_rect.width() - scaled.width()) / 2.0,
+                page_rect.y() + (page_rect.height() - scaled.height()) / 2.0,
+                scaled.width(), scaled.height())
+            painter.drawImage(target, image)
+        finally:
+            painter.end()
 
     def _print_dialog(self) -> None:
-        if not self._warn_empty_slots():
+        if not self._confirm_preflight("Продолжить к печати"):
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -1439,32 +2081,32 @@ class MainWindow(QMainWindow):
 
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         printer.setResolution(300)
-        from PySide6.QtGui import QPageSize
-        w_mm, h_mm = (150, 100) if self.project.landscape else (100, 150)
-        printer.setPageSize(QPageSize(QSizeF(w_mm, h_mm), QPageSize.Unit.Millimeter))
+        w_mm = self.project.sheet_width_cm * 10.0
+        h_mm = self.project.sheet_height_cm * 10.0
+        printer.setPageSize(
+            QPageSize(QSizeF(w_mm, h_mm), QPageSize.Unit.Millimeter))
         printer.setFullPage(True)
         printer.setPageMargins(0, 0, 0, 0, QPrinter.Unit.Millimeter)
 
-        dialog = QPrintDialog(printer, self)
-        dialog.setWindowTitle("Печать листа 10×15")
-        if dialog.exec() != QPrintDialog.DialogCode.Accepted:
-            return
-        painter = QPainter(printer)
-        rect: QRect = printer.pageRect(QPrinter.Unit.DevicePixel)
-        painter.drawImage(rect, qimg)
-        painter.end()
-        self.statusBar().showMessage("Лист отправлен на печать", 5000)
+        dialog = QPrintPreviewDialog(printer, self)
+        dialog.setWindowTitle(
+            f"Предпросмотр и печать листа {self.project.sheet_label}")
+        dialog.paintRequested.connect(
+            lambda target_printer: self._draw_image_to_printer(
+                target_printer, qimg))
+        dialog.exec()
+        self.statusBar().showMessage("Предпросмотр печати закрыт", 3000)
 
     def _about(self) -> None:
         QMessageBox.about(
             self, "О программе",
             f"<b>Softpalaroid {__version__}</b><br><br>"
             "Создание полароидных снимков из фотографий и их раскладка "
-            "на листе 10×15 см для печати (300 DPI).<br><br>"
-            "Наклон, размер, масштаб, поворот и сдвиг фото редактируются "
-            "прямо в окне предпросмотра и с панели справа. "
-            "На листе может быть до 12 карточек, вокруг них печатаются "
-            "уголки обреза.<br><br>"
+            "на фотобумаге 10×15, 13×18, 15×21, A5, A4 или произвольном "
+            "листе для печати (300 DPI).<br><br>"
+            "Поддерживаются классический Polaroid и форматы Instax, RAW, "
+            "проверка фактического DPI и безопасной области, шаблоны, "
+            "пакетная обработка, JPG/PNG/PDF и предпросмотр печати.<br><br>"
             "Тёмный интерфейс в стиле X. Шрифты: Inter и Caveat (OFL).")
 
     # ---------------------------------------------------------- drag & drop
@@ -1478,20 +2120,5 @@ class MainWindow(QMainWindow):
                  and is_supported_image_file(path)]
         if not files:
             return
-        before = self._snapshot_state()
-        loaded_any = False
-        slot = self._selected_index()
-        for path in files:
-            if slot >= len(self.project.items):
-                if len(self.project.items) >= MAX_CARDS:
-                    break
-                self.project.add_item()
-            if self._load_photo_into(slot, path, record_history=False):
-                loaded_any = True
-                slot += 1
-        if loaded_any:
-            self.canvas.on_layout_changed()
-            self._sync_layout_controls()
-            self._sync_panel()
-            self._commit_change(before)
+        self._load_photo_paths(files, self._selected_index())
         e.acceptProposedAction()

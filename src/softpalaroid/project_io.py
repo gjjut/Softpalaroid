@@ -21,10 +21,10 @@ from pathlib import Path, PurePosixPath
 
 from . import __version__
 from .image_io import probe_image_size
-from .model import PolaroidItem, Project
+from .model import PolaroidItem, Project, DEFAULT_SAFE_MARGIN_MM, stable_grain_seed
 
 FORMAT_NAME = "softpalaroid-project"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 PROJECT_EXTENSION = ".softpalaroid"
 PROJECT_FILE_FILTER = "Проект Softpalaroid (*.softpalaroid);;Все файлы (*)"
 MANIFEST_NAME = "manifest.json"
@@ -62,6 +62,16 @@ def _item_state(item: PolaroidItem, photo_ref: str | None,
         "flip_horizontal": bool(item.flip_horizontal),
         "flip_vertical": bool(item.flip_vertical),
         "frame_color": item.frame_color,
+        "card_format": item.card_format,
+        "filter_intensity": float(item.filter_intensity),
+        "brightness": float(item.brightness),
+        "contrast": float(item.contrast),
+        "saturation": float(item.saturation),
+        "sharpness": float(item.sharpness),
+        "caption_scale": float(item.caption_scale),
+        "caption_color": item.caption_color,
+        "caption_align": item.caption_align,
+        "grain_seed": int(item.effective_grain_seed()),
     }
 
 
@@ -71,6 +81,14 @@ def project_state_dict(project: Project) -> dict:
         "landscape": bool(project.landscape),
         "background_color": project.background_color,
         "cut_marks": bool(project.cut_marks),
+        "paper_size": project.paper_size,
+        "sheet_width_cm": float(project.sheet_width_cm),
+        "sheet_height_cm": float(project.sheet_height_cm),
+        "card_format": project.card_format,
+        "template": project.template,
+        "safe_margin_mm": float(project.safe_margin_mm),
+        "show_safe_area": bool(project.show_safe_area),
+        "snap_enabled": bool(project.snap_enabled),
         "items": [
             _item_state(item, item.photo_path, use_photo_path=True)
             for item in project.items
@@ -118,6 +136,14 @@ def save_project_file(project: Project, path: str | os.PathLike,
         "landscape": bool(project.landscape),
         "background_color": project.background_color,
         "cut_marks": bool(project.cut_marks),
+        "paper_size": project.paper_size,
+        "sheet_width_cm": float(project.sheet_width_cm),
+        "sheet_height_cm": float(project.sheet_height_cm),
+        "card_format": project.card_format,
+        "template": project.template,
+        "safe_margin_mm": float(project.safe_margin_mm),
+        "show_safe_area": bool(project.show_safe_area),
+        "snap_enabled": bool(project.snap_enabled),
         "selected_index": int(selected_index),
         "items": [
             _item_state(
@@ -223,10 +249,22 @@ def load_project_file(path: str | os.PathLike,
             if not isinstance(raw_items, list):
                 raise ProjectFileError("В проекте отсутствует список карточек")
 
+            landscape = _bool_value(manifest, "landscape", True)
             project = Project(
-                landscape=_bool_value(manifest, "landscape", True),
+                landscape=landscape,
                 background_color=str(manifest.get("background_color", "#ffffff")),
                 cut_marks=_bool_value(manifest, "cut_marks", True),
+                paper_size=str(manifest.get("paper_size", "10x15")),
+                sheet_width_cm=_float_value(
+                    manifest, "sheet_width_cm", 15.0 if landscape else 10.0),
+                sheet_height_cm=_float_value(
+                    manifest, "sheet_height_cm", 10.0 if landscape else 15.0),
+                card_format=str(manifest.get("card_format", "classic")),
+                template=str(manifest.get("template", "classic")),
+                safe_margin_mm=_float_value(
+                    manifest, "safe_margin_mm", DEFAULT_SAFE_MARGIN_MM),
+                show_safe_area=_bool_value(manifest, "show_safe_area", True),
+                snap_enabled=_bool_value(manifest, "snap_enabled", True),
             )
             warnings: list[str] = []
 
@@ -249,6 +287,19 @@ def load_project_file(path: str | os.PathLike,
                     flip_horizontal=_bool_value(raw, "flip_horizontal", False),
                     flip_vertical=_bool_value(raw, "flip_vertical", False),
                     frame_color=str(raw.get("frame_color", "#fcfcfa")),
+                    card_format=str(raw.get(
+                        "card_format", manifest.get("card_format", "classic"))),
+                    filter_intensity=_float_value(raw, "filter_intensity", 1.0),
+                    brightness=_float_value(raw, "brightness", 1.0),
+                    contrast=_float_value(raw, "contrast", 1.0),
+                    saturation=_float_value(raw, "saturation", 1.0),
+                    sharpness=_float_value(raw, "sharpness", 1.0),
+                    caption_scale=_float_value(raw, "caption_scale", 1.0),
+                    caption_color=(str(raw.get("caption_color"))
+                                   if isinstance(raw.get("caption_color"), str)
+                                   else None),
+                    caption_align=str(raw.get("caption_align", "center")),
+                    grain_seed=_int_value(raw, "grain_seed", 0),
                 )
 
                 photo_ref = raw.get("photo")
@@ -276,6 +327,12 @@ def load_project_file(path: str | os.PathLike,
                             item.photo_size = None
                             warnings.append(
                                 f"Слот {slot}: фотографию не удалось прочитать")
+                if item.photo_path and not item.grain_seed:
+                    # Для v1/v2 seed нельзя привязывать к временной папке:
+                    # внутренний путь архива стабилен между открытиями.
+                    item.grain_seed = stable_grain_seed(
+                        str(photo_ref) if photo_ref else None,
+                        item.photo_size)
                 item.clamp()
                 project.items.append(item)
 
@@ -286,6 +343,7 @@ def load_project_file(path: str | os.PathLike,
             selected = manifest.get("selected_index", 0)
             if not isinstance(selected, int):
                 selected = 0
+            project.clamp_settings()
             selected = max(0, min(len(project.items) - 1, selected))
             metadata = manifest.get("metadata")
             if not isinstance(metadata, dict):
