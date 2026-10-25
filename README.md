@@ -16,6 +16,10 @@
 - 🖤 Современный интерфейс в стиле X: чёрная тема, шрифт Inter, акцент #1D9BF0
 - 📐 Лист 10×15 см: альбомная (15×10) или книжная (10×15) ориентация
 - 🖼️ Раскладка: **1, 2 или 4** полароида на листе (в каждое — своё фото)
+- 📷 Практически любые растровые форматы фото: **JFIF**, JPG/JPEG, HEIC/HEIF,
+  AVIF, PNG, WebP, GIF, BMP, TIFF, JPEG 2000, QOI, TGA, PSD и другие;
+  формат распознаётся по содержимому файла, а не только по расширению,
+  для анимированных изображений берётся первый кадр
 - 🖱️ Редактирование **прямо в окне предпросмотра**:
   - масштаб фото внутри рамки — колесом мыши
   - наклон карточки — ручкой сверху, `Shift`+колесо или `Alt`+перетаскивание
@@ -93,7 +97,7 @@ pyinstaller packaging/Softpalaroid.spec --noconfirm
 
 1. Поднять версию в `src/softpalaroid/__init__.py` и `MyAppVersion` в
    `packaging/installer.iss`.
-2. `git tag v0.4.0 && git push origin v0.4.0` — GitHub Actions соберёт
+2. `git tag v0.5.0 && git push origin v0.5.0` — GitHub Actions соберёт
    установщик и прикрепит его к новому Release.
 
 ## Структура проекта
@@ -104,6 +108,7 @@ src/softpalaroid/
     model.py                — геометрия листа и полароида, раскладки 1/2/4
     filters.py              — плёночные фильтры (Pillow)
     render.py               — рендер листа в 300 DPI для экспорта/печати
+    image_io.py             — загрузка изображений и регистрация кодеков
     project_io.py           — формат проектов .softpalaroid (ZIP + manifest)
     canvas.py               — интерактивный предпросмотр (мышь, наклон, масштаб)
     main_window.py          — главное окно и панель настроек
@@ -131,7 +136,7 @@ QT_QPA_PLATFORM=offscreen python tools/smoke_gui.py   # GUI-прогон
 ## Стек
 
 Python 3.11+ · [PySide6 (Qt)](https://doc.qt.io/qtforpython-6/) ·
-[Pillow](https://pillow.readthedocs.io/) · шрифты Inter и Caveat (OFL) ·
+[Pillow](https://pillow.readthedocs.io/) и pillow-heif · шрифты Inter и Caveat (OFL) ·
 [PyInstaller](https://pyinstaller.org/) · [Inno Setup](https://jrsoftware.org/isinfo.php)
 
 ## Планы

@@ -54,11 +54,11 @@ from .project_io import (
     project_state_key,
     save_project_file,
 )
-from .render import load_photo, render_sheet, save_sheet
+from .image_io import image_file_filter, is_supported_image_file, load_photo
+from .render import render_sheet, save_sheet
 from .resources import asset_path
 
-IMAGE_FILTER = "Изображения (*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff);;Все файлы (*)"
-IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
+IMAGE_FILTER = image_file_filter()
 HISTORY_LIMIT = 100
 AUTOSAVE_FILENAME = "autosave.softpalaroid"
 
@@ -1136,8 +1136,9 @@ class MainWindow(QMainWindow):
             e.acceptProposedAction()
 
     def dropEvent(self, e: QDropEvent) -> None:  # noqa: N802
-        files = [u.toLocalFile() for u in e.mimeData().urls()
-                 if u.toLocalFile().lower().endswith(IMAGE_EXTS)]
+        files = [path for url in e.mimeData().urls()
+                 if (path := url.toLocalFile())
+                 and is_supported_image_file(path)]
         if not files:
             return
         before = self._snapshot_state()

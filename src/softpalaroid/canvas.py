@@ -34,7 +34,8 @@ from PySide6.QtWidgets import QWidget
 
 from .filters import apply_filter
 from .model import PHOTO_INSET_FRAC, PolaroidItem, Project
-from .render import CAPTION_COLOR, FRAME_COLOR, load_photo
+from .image_io import load_photo
+from .render import CAPTION_COLOR, FRAME_COLOR
 
 PREVIEW_MAX_SIDE = 1200  # px: разрешение фото для превью (экспорт всегда в полном)
 

@@ -3,7 +3,7 @@
 ; Результат: dist\installer\Softpalaroid-Setup-<версия>.exe
 
 #define MyAppName "Softpalaroid"
-#define MyAppVersion "0.3.0"
+#define MyAppVersion "0.4.0"
 #define MyAppPublisher "gjjut"
 #define MyAppURL "https://github.com/gjjut/Softpalaroid"
 #define MyAppExeName "Softpalaroid.exe"
