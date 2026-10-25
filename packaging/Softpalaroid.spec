@@ -6,14 +6,20 @@
 """
 import os
 
+from PyInstaller.utils.hooks import collect_dynamic_libs
+
 ROOT = os.path.dirname(SPECPATH)
+
+# pillow-heif: нативный модуль и DLL libheif/libde265 должны попасть в сборку,
+# иначе HEIC/HEIF не откроются именно в .exe (в исходниках всё работает).
+heif_binaries = collect_dynamic_libs("pillow_heif")
 
 a = Analysis(
     [os.path.join(ROOT, "run.py")],
     pathex=[os.path.join(ROOT, "src"), ROOT],
-    binaries=[],
+    binaries=heif_binaries,
     datas=[(os.path.join(ROOT, "assets"), "assets")],
-    hiddenimports=[],
+    hiddenimports=["pillow_heif", "_pillow_heif"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

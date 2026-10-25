@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import zipfile
@@ -18,9 +19,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-from PIL import Image, ImageOps
-
 from . import __version__
+from .image_io import probe_image_size
 from .model import PolaroidItem, Project
 
 FORMAT_NAME = "softpalaroid-project"
@@ -29,7 +29,7 @@ PROJECT_EXTENSION = ".softpalaroid"
 PROJECT_FILE_FILTER = "Проект Softpalaroid (*.softpalaroid);;Все файлы (*)"
 MANIFEST_NAME = "manifest.json"
 
-_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+_SAFE_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,12}$")
 
 
 class ProjectFileError(ValueError):
@@ -100,7 +100,7 @@ def save_project_file(project: Project, path: str | os.PathLike,
         key = _absolute_key(item.photo_path)
         if key not in image_refs:
             suffix = source.suffix.lower()
-            if suffix not in _IMAGE_SUFFIXES:
+            if not _SAFE_SUFFIX_RE.fullmatch(suffix):
                 suffix = ".bin"
             image_refs[key] = f"images/img-{len(image_refs) + 1:03d}{suffix}"
 
@@ -149,11 +149,6 @@ def save_project_file(project: Project, path: str | os.PathLike,
     finally:
         if temp_path.exists():
             temp_path.unlink(missing_ok=True)
-
-
-def _image_size(path: Path) -> tuple[int, int]:
-    with Image.open(path) as img:
-        return ImageOps.exif_transpose(img).size
 
 
 def _safe_internal_path(value: object) -> PurePosixPath:
@@ -243,7 +238,7 @@ def load_project_file(path: str | os.PathLike,
                             shutil.copyfileobj(src, dst)
                         try:
                             item.photo_path = str(target)
-                            item.photo_size = _image_size(target)
+                            item.photo_size = probe_image_size(target)
                         except Exception:  # noqa: BLE001 - битое фото не рушит проект
                             item.photo_path = None
                             item.photo_size = None

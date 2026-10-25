@@ -73,6 +73,24 @@ class TestProjectIO(unittest.TestCase):
             self.assertTrue(os.path.isfile(first.photo_path))
             self.assertEqual(first.photo_size, size)
 
+    def test_jfif_roundtrip_preserves_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            photo = os.path.join(tmp, "source.jfif")
+            project = self._project(photo, _make_photo(photo))
+            filename = os.path.join(tmp, "jfif.softpalaroid")
+            save_project_file(project, filename)
+
+            with zipfile.ZipFile(filename) as zf:
+                images = [n for n in zf.namelist() if n.startswith("images/")]
+            self.assertEqual(len(images), 1)
+            self.assertTrue(images[0].endswith(".jfif"), images)
+
+            loaded = load_project_file(
+                filename, os.path.join(tmp, "extract-jfif"))
+            self.assertEqual(loaded.warnings, [])
+            self.assertTrue(
+                loaded.project.items[0].photo_path.endswith(".jfif"))
+
     def test_missing_image_in_archive_becomes_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             photo = os.path.join(tmp, "source.jpg")

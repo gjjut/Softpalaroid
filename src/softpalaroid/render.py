@@ -8,9 +8,10 @@ from __future__ import annotations
 import os
 import sys
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from .filters import apply_filter
+from .image_io import load_photo
 from .model import DPI, PHOTO_INSET_FRAC, PolaroidItem, Project
 from .resources import asset_path
 
@@ -18,19 +19,6 @@ FRAME_COLOR = (252, 252, 250)
 CAPTION_COLOR = (52, 52, 58)
 PLACEHOLDER_COLOR = (225, 225, 228)
 SS = 2  # supersampling карточки для гладких краёв после поворота
-
-
-def load_photo(path: str) -> Image.Image:
-    """Загрузить фото с учётом EXIF-ориентации, в RGB.
-
-    Возвращается полностью загруженная копия, файл сразу закрывается —
-    важно для Windows (открытый файл нельзя удалить/перезаписать).
-    """
-    with Image.open(path) as src:
-        img = ImageOps.exif_transpose(src)
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        return img.copy()
 
 
 def _font_candidates() -> list[str]:

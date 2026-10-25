@@ -1,4 +1,4 @@
-"""GUI smoke-тест для CI: запуск окна, загрузка фото, экспорт листа.
+"""GUI smoke-тест для CI: запуск окна, загрузка JFIF, проект, экспорт листа.
 
 Запуск:  QT_QPA_PLATFORM=offscreen python tools/smoke_gui.py
 Печатает "SMOKE OK" и завершается с кодом 0 при успехе.
@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw  # noqa: E402
 from PySide6.QtGui import QFontDatabase  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from softpalaroid.main_window import MainWindow  # noqa: E402
+from softpalaroid.main_window import IMAGE_FILTER, MainWindow  # noqa: E402
 from softpalaroid.render import save_sheet  # noqa: E402
 from softpalaroid.theme import apply_theme  # noqa: E402
 
@@ -35,13 +35,14 @@ def main() -> None:
           "| app font:", app.font().family(), flush=True)
     assert any(f.startswith("Inter") for f in families), "Inter font not registered"
     assert any(f.startswith("Caveat") for f in families), "Caveat font not registered"
+    assert "*.jfif" in IMAGE_FILTER and "*.heic" in IMAGE_FILTER, IMAGE_FILTER
     win = MainWindow()
     win._skip_unsaved_prompt = True  # noqa: SLF001 - headless-тест без диалогов
     win.show()
     _stage("window shown")
 
     with tempfile.TemporaryDirectory() as tmp:
-        photo = os.path.join(tmp, "photo.jpg")
+        photo = os.path.join(tmp, "photo.jfif")
         img = Image.new("RGB", (1000, 800), (100, 150, 210))
         d = ImageDraw.Draw(img)
         d.ellipse([650, 80, 880, 310], fill=(250, 210, 110))
