@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import math
+import random
 import re
 from dataclasses import dataclass, field
 
@@ -46,6 +47,19 @@ MIN_CARD_WIDTH_PX = 1.8 * PX_PER_CM
 MAX_CARD_WIDTH_PX = 25.0 * PX_PER_CM
 
 DEFAULT_BACKGROUND_COLOR = "#ffffff"
+DEFAULT_BACKGROUND_COLOR2 = "#dceeff"
+
+# Стили фона листа: ключ -> подпись для интерфейса.
+BACKGROUND_STYLES: dict[str, str] = {
+    "solid": "Однотонный",
+    "gradient": "Градиент",
+    "dots": "Точки",
+    "grid": "Сетка",
+}
+BACKGROUND_DOT_SPACING_PX = 72.0
+BACKGROUND_DOT_RADIUS_PX = 8.0
+BACKGROUND_GRID_SPACING_PX = 96.0
+BACKGROUND_GRID_WIDTH_PX = 3.0
 DEFAULT_FRAME_COLOR = "#fcfcfa"
 DEFAULT_CAPTION_COLOR = (52, 52, 58)
 LIGHT_CAPTION_COLOR = (250, 250, 246)
@@ -476,6 +490,8 @@ class Project:
     landscape: bool = True
     items: list[PolaroidItem] = field(default_factory=list)
     background_color: str = DEFAULT_BACKGROUND_COLOR
+    background_style: str = "solid"
+    background_color2: str = DEFAULT_BACKGROUND_COLOR2
     cut_marks: bool = True
 
     paper_size: str = "10x15"
@@ -518,6 +534,10 @@ class Project:
         return color_to_rgb(self.background_color, DEFAULT_BACKGROUND_COLOR)
 
     @property
+    def background_rgb2(self) -> tuple[int, int, int]:
+        return color_to_rgb(self.background_color2, DEFAULT_BACKGROUND_COLOR2)
+
+    @property
     def card_format_spec(self) -> CardFormat:
         return get_card_format(self.card_format)
 
@@ -534,6 +554,11 @@ class Project:
     def clamp_settings(self) -> None:
         self.background_color = normalize_color(
             self.background_color, DEFAULT_BACKGROUND_COLOR)
+        self.background_style = str(self.background_style or "solid").lower()
+        if self.background_style not in BACKGROUND_STYLES:
+            self.background_style = "solid"
+        self.background_color2 = normalize_color(
+            self.background_color2, DEFAULT_BACKGROUND_COLOR2)
         self.cut_marks = bool(self.cut_marks)
         self.show_safe_area = bool(self.show_safe_area)
         self.snap_enabled = bool(self.snap_enabled)
@@ -663,3 +688,83 @@ class Project:
         item = self.items.pop(index)
         self.items.insert(new_index, item)
         return new_index
+
+    # ------------------------------------------ выравнивание всех карточек
+    def align_items(self, mode: str) -> None:
+        """Выровнять все карточки по общему краю или центру их границ."""
+        if len(self.items) < 2:
+            return
+        bounds = [item.bounds_sheet() for item in self.items]
+        if mode == "left":
+            target = min(b[0] for b in bounds)
+            for item, b in zip(self.items, bounds):
+                item.center_x += target - b[0]
+        elif mode == "right":
+            target = max(b[2] for b in bounds)
+            for item, b in zip(self.items, bounds):
+                item.center_x += target - b[2]
+        elif mode == "center_x":
+            target = (min(b[0] for b in bounds)
+                      + max(b[2] for b in bounds)) / 2.0
+            for item, b in zip(self.items, bounds):
+                item.center_x += target - (b[0] + b[2]) / 2.0
+        elif mode == "top":
+            target = min(b[1] for b in bounds)
+            for item, b in zip(self.items, bounds):
+                item.center_y += target - b[1]
+        elif mode == "bottom":
+            target = max(b[3] for b in bounds)
+            for item, b in zip(self.items, bounds):
+                item.center_y += target - b[3]
+        elif mode == "center_y":
+            target = (min(b[1] for b in bounds)
+                      + max(b[3] for b in bounds)) / 2.0
+            for item, b in zip(self.items, bounds):
+                item.center_y += target - (b[1] + b[3]) / 2.0
+        else:
+            raise ValueError(f"Неизвестный режим выравнивания: {mode}")
+        for item in self.items:
+            item.clamp()
+
+    def distribute_items(self, axis: str) -> None:
+        """Равномерно распределить центры карточек между крайними."""
+        if len(self.items) < 3:
+            return
+        if axis == "x":
+            ordered = sorted(self.items, key=lambda it: it.center_x)
+            first, last = ordered[0].center_x, ordered[-1].center_x
+            step = (last - first) / (len(ordered) - 1)
+            for i, item in enumerate(ordered):
+                item.center_x = first + step * i
+        elif axis == "y":
+            ordered = sorted(self.items, key=lambda it: it.center_y)
+            first, last = ordered[0].center_y, ordered[-1].center_y
+            step = (last - first) / (len(ordered) - 1)
+            for i, item in enumerate(ordered):
+                item.center_y = first + step * i
+        else:
+            raise ValueError(f"Неизвестная ось распределения: {axis}")
+        for item in self.items:
+            item.clamp()
+
+    def straighten_items(self) -> None:
+        """Убрать наклон у всех карточек."""
+        for item in self.items:
+            item.rotation = 0.0
+            item.clamp()
+
+    def scatter_items(self, *, seed: int | None = None,
+                      max_rotation: float = 4.0,
+                      max_shift_frac: float = 0.02) -> None:
+        """Живой «разброс»: небольшие случайные наклоны и сдвиги карточек.
+
+        При фиксированном seed результат повторяем (удобно для тестов).
+        """
+        rng = random.Random(seed)
+        for item in self.items:
+            item.rotation = rng.uniform(-max_rotation, max_rotation)
+            item.center_x += rng.uniform(-1.0, 1.0) * self.sheet_w * max_shift_frac
+            item.center_y += rng.uniform(-1.0, 1.0) * self.sheet_h * max_shift_frac
+            item.center_x = max(0.0, min(float(self.sheet_w), item.center_x))
+            item.center_y = max(0.0, min(float(self.sheet_h), item.center_y))
+            item.clamp()

@@ -13,6 +13,10 @@ from PIL import Image, ImageDraw, ImageFont
 from .filters import apply_filter, apply_photo_adjustments, transform_photo
 from .image_io import load_photo, srgb_icc_profile
 from .model import (
+    BACKGROUND_DOT_RADIUS_PX,
+    BACKGROUND_DOT_SPACING_PX,
+    BACKGROUND_GRID_SPACING_PX,
+    BACKGROUND_GRID_WIDTH_PX,
     CUT_MARK_WIDTH_PX,
     DPI,
     PolaroidItem,
@@ -221,11 +225,57 @@ def _finished_card(item: PolaroidItem,
     return rotated
 
 
+def make_background(project: Project,
+                    background: tuple[int, int, int] | None = None) -> Image.Image:
+    """Фон листа по стилю проекта: однотонный, градиент, точки или сетка.
+
+    Явный ``background`` (например, белый для печати) всегда даёт однотонную
+    заливку и игнорирует стиль.
+    """
+    width, height = project.sheet_w, project.sheet_h
+    color1 = project.background_rgb if background is None else background
+    sheet = Image.new("RGB", (width, height), color1)
+    style = project.background_style if background is None else "solid"
+    if style == "solid":
+        return sheet
+    color2 = project.background_rgb2
+    draw = ImageDraw.Draw(sheet)
+    if style == "gradient":
+        for y in range(height):
+            t = y / max(1, height - 1)
+            draw.line(
+                [(0, y), (width, y)],
+                fill=tuple(int(round(a + (b - a) * t))
+                           for a, b in zip(color1, color2)))
+    elif style == "dots":
+        spacing = BACKGROUND_DOT_SPACING_PX
+        radius = BACKGROUND_DOT_RADIUS_PX
+        row = 0
+        y = spacing / 2.0
+        while y < height + radius:
+            x = spacing / 2.0 + (spacing / 2.0 if row % 2 else 0.0)
+            while x < width + radius:
+                draw.ellipse(
+                    [x - radius, y - radius, x + radius, y + radius],
+                    fill=color2)
+                x += spacing
+            y += spacing
+            row += 1
+    elif style == "grid":
+        spacing = int(BACKGROUND_GRID_SPACING_PX)
+        line_w = max(1, int(round(BACKGROUND_GRID_WIDTH_PX)))
+        for x in range(0, width + 1, spacing):
+            draw.line([(x, 0), (x, height)], fill=color2, width=line_w)
+        for y in range(0, height + 1, spacing):
+            draw.line([(0, y), (width, y)], fill=color2, width=line_w)
+    return sheet
+
+
 def render_sheet(project: Project,
                  background: tuple[int, int, int] | None = None) -> Image.Image:
     """Полный лист в экспортном разрешении, без теней карточек."""
     bg = project.background_rgb if background is None else background
-    sheet = Image.new("RGB", (project.sheet_w, project.sheet_h), bg)
+    sheet = make_background(project, background)
     if project.cut_marks:
         draw_cut_marks(sheet, project, bg)
     for item in project.items:

@@ -16,26 +16,32 @@ from __future__ import annotations
 import math
 from enum import Enum, auto
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QLineF, QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
     QFontMetricsF,
     QImage,
+    QLinearGradient,
     QMouseEvent,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
+    QPolygonF,
     QWheelEvent,
 )
 from PIL import UnidentifiedImageError
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QToolButton, QWidget
 
 from .filters import apply_filter, apply_photo_adjustments, transform_photo
 from .image_io import load_photo
 from .model import (
+    BACKGROUND_DOT_RADIUS_PX,
+    BACKGROUND_DOT_SPACING_PX,
+    BACKGROUND_GRID_SPACING_PX,
+    BACKGROUND_GRID_WIDTH_PX,
     CUT_MARK_WIDTH_PX,
     PolaroidItem,
     Project,
@@ -68,6 +74,14 @@ class _DragMode(Enum):
 
 
 class CanvasWidget(QWidget):
+    # Цвета рабочего пространства вокруг листа для тёмной/светлой темы UI.
+    _WORKSPACE = {
+        "dark": {"bg": "#000000", "dots": "#17191c",
+                 "glow": (255, 255, 255, 10), "sheet_border": "#2f3336"},
+        "light": {"bg": "#eef1f3", "dots": "#dde5ea",
+                  "glow": (15, 20, 25, 10), "sheet_border": "#cfd9de"},
+    }
+
     selectionChanged = Signal(int)
     itemChanged = Signal()
     photoLoadRequested = Signal(int)
@@ -107,6 +121,10 @@ class CanvasWidget(QWidget):
         self._start_width = 0.0
         self._start_local_vector = QPointF()
         self._snap_guides: list[tuple[str, float]] = []
+        self._ui_theme = "dark"
+        self._dot_tile_key: tuple | None = None
+        self._dot_tile: QPixmap | None = None
+        self._build_zoom_toolbar()
 
     # ------------------------------------------------------------------ API
     def set_project(self, project: Project) -> None:
@@ -210,7 +228,72 @@ class CanvasWidget(QWidget):
     def reset_view(self) -> None:
         self._view_zoom = 1.0
         self._pan = QPointF(0.0, 0.0)
+        self._sync_zoom_label()
         self.update()
+
+    # ------------------------------------------- тема и масштаб просмотра
+    def set_ui_theme(self, mode: str) -> None:
+        """Перекрасить рабочее пространство холста под тему интерфейса."""
+        self._ui_theme = mode if mode in self._WORKSPACE else "dark"
+        self.update()
+
+    def _build_zoom_toolbar(self) -> None:
+        bar = QFrame(self)
+        bar.setObjectName("canvasToolbar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(2)
+
+        def make_button(text: str, tooltip: str, slot,
+                        width: int = 30) -> QToolButton:
+            button = QToolButton()
+            button.setText(text)
+            button.setToolTip(tooltip)
+            button.setAccessibleName(tooltip)
+            button.setFixedSize(width, 28)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(slot)
+            lay.addWidget(button)
+            return button
+
+        make_button("-", "Уменьшить масштаб просмотра",
+                    lambda: self.zoom_step(1 / 1.2))
+        self._zoom_label = QLabel("100%")
+        self._zoom_label.setObjectName("zoomLabel")
+        self._zoom_label.setFixedWidth(46)
+        self._zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self._zoom_label)
+        make_button("+", "Увеличить масштаб просмотра",
+                    lambda: self.zoom_step(1.2))
+        make_button("Вписать", "Вписать лист в окно (сброс масштаба и сдвига)",
+                    self.reset_view, width=74)
+        bar.adjustSize()
+        self._zoom_toolbar = bar
+
+    def _position_zoom_toolbar(self) -> None:
+        if not hasattr(self, "_zoom_toolbar"):
+            return
+        self._zoom_toolbar.adjustSize()
+        self._zoom_toolbar.move(
+            12, max(12, self.height() - self._zoom_toolbar.height() - 12))
+        self._zoom_toolbar.raise_()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._position_zoom_toolbar()
+
+    def _sync_zoom_label(self) -> None:
+        if hasattr(self, "_zoom_label"):
+            self._zoom_label.setText(f"{round(self._view_zoom * 100)}%")
+
+    def set_view_zoom(self, value: float) -> None:
+        """Масштаб просмотра относительно «вписать в окно» (1.0 = 100%)."""
+        self._view_zoom = max(0.4, min(5.0, float(value)))
+        self._sync_zoom_label()
+        self.update()
+
+    def zoom_step(self, factor: float) -> None:
+        self.set_view_zoom(self._view_zoom * factor)
 
     # ----------------------------------------------------- преобразования
     def _scale(self) -> float:
@@ -354,13 +437,16 @@ class CanvasWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        p.fillRect(self.rect(), QColor("#000000"))
+        workspace = self._WORKSPACE[self._ui_theme]
+        p.fillRect(self.rect(), QColor(workspace["bg"]))
         # Едва заметная точечная сетка рабочего пространства
-        p.setPen(QPen(QColor("#17191c"), 2))
+        p.setPen(QPen(QColor(workspace["dots"]), 2))
         step = 28
-        for gx in range(step, self.width(), step):
-            for gy in range(step, self.height(), step):
-                p.drawPoint(gx, gy)
+        p.drawPoints(QPolygonF([
+            QPointF(gx, gy)
+            for gx in range(step, self.width(), step)
+            for gy in range(step, self.height(), step)
+        ]))
 
         if self.project is None:
             return
@@ -371,9 +457,10 @@ class CanvasWidget(QWidget):
             self.project.sheet_w * scale, self.project.sheet_h * scale,
         )
         # «Свечение»-подложка рабочего пространства, контур и сам лист
-        p.fillRect(sheet_rect.adjusted(-10, -10, 10, 10), QColor(255, 255, 255, 10))
-        p.fillRect(sheet_rect, QColor(self.project.background_color))
-        p.setPen(QPen(QColor("#2f3336"), 1))
+        p.fillRect(sheet_rect.adjusted(-10, -10, 10, 10),
+                   QColor(*workspace["glow"]))
+        self._paint_sheet_background(p, sheet_rect)
+        p.setPen(QPen(QColor(workspace["sheet_border"]), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(sheet_rect)
         self._paint_cut_marks(p, origin, scale)
@@ -387,6 +474,72 @@ class CanvasWidget(QWidget):
         if self.project.items:
             selected = max(0, min(self.selected, len(self.project.items) - 1))
             self._paint_selection(p, self.project.items[selected], origin, scale)
+
+    def _dot_pattern_tile(self, spacing: float, color: QColor) -> QPixmap:
+        """Тайл узора «точки»: две строки со сдвигом, кэш по масштабу/цвету."""
+        tile_w = max(2, int(round(spacing)))
+        tile_h = tile_w * 2
+        radius = max(
+            0.8, BACKGROUND_DOT_RADIUS_PX * spacing / BACKGROUND_DOT_SPACING_PX)
+        key = (tile_w, round(radius, 3), color.rgba())
+        if self._dot_tile is not None and self._dot_tile_key == key:
+            return self._dot_tile
+        tile = QPixmap(tile_w, tile_h)
+        tile.fill(Qt.GlobalColor.transparent)
+        tp = QPainter(tile)
+        tp.setRenderHint(QPainter.RenderHint.Antialiasing)
+        tp.setPen(Qt.PenStyle.NoPen)
+        tp.setBrush(QBrush(color))
+        for cx, cy in ((tile_w / 2.0, tile_h / 4.0),
+                       (0.0, 3.0 * tile_h / 4.0),
+                       (float(tile_w), 3.0 * tile_h / 4.0)):
+            tp.drawEllipse(QRectF(
+                cx - radius, cy - radius, radius * 2, radius * 2))
+        tp.end()
+        self._dot_tile_key = key
+        self._dot_tile = tile
+        return tile
+
+    def _paint_sheet_background(self, p: QPainter, rect: QRectF) -> None:
+        """Фон листа в предпросмотре — теми же стилями, что и в экспорте."""
+        if self.project is None:
+            return
+        color1 = QColor(self.project.background_color)
+        style = self.project.background_style
+        if style == "gradient":
+            gradient = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+            gradient.setColorAt(0.0, color1)
+            gradient.setColorAt(1.0, QColor(self.project.background_color2))
+            p.fillRect(rect, gradient)
+            return
+        p.fillRect(rect, color1)
+        if style not in {"dots", "grid"}:
+            return
+        scale = rect.width() / max(1.0, float(self.project.sheet_w))
+        color2 = QColor(self.project.background_color2)
+        p.save()
+        p.setClipRect(rect)
+        if style == "dots":
+            spacing = BACKGROUND_DOT_SPACING_PX * scale
+            if spacing >= 4.0:
+                tile = self._dot_pattern_tile(spacing, color2)
+                p.setBrushOrigin(QPointF(rect.left(), rect.top()))
+                p.fillRect(rect, QBrush(tile))
+        else:  # grid
+            spacing = BACKGROUND_GRID_SPACING_PX * scale
+            if spacing >= 4.0:
+                p.setPen(QPen(color2, max(0.6, BACKGROUND_GRID_WIDTH_PX * scale)))
+                lines: list[QLineF] = []
+                x = rect.left()
+                while x <= rect.right() + 0.5:
+                    lines.append(QLineF(x, rect.top(), x, rect.bottom()))
+                    x += spacing
+                y = rect.top()
+                while y <= rect.bottom() + 0.5:
+                    lines.append(QLineF(rect.left(), y, rect.right(), y))
+                    y += spacing
+                p.drawLines(lines)
+        p.restore()
 
     def _paint_safe_area(self, p: QPainter,
                          origin: QPointF, scale: float) -> None:
@@ -486,12 +639,14 @@ class CanvasWidget(QWidget):
         p.save()
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        for item in self.project.items:
-            for (x1, y1), (x2, y2) in item.cut_mark_segments():
-                p.drawLine(
-                    QPointF(origin.x() + x1 * scale, origin.y() + y1 * scale),
-                    QPointF(origin.x() + x2 * scale, origin.y() + y2 * scale),
-                )
+        lines = [
+            QLineF(origin.x() + x1 * scale, origin.y() + y1 * scale,
+                   origin.x() + x2 * scale, origin.y() + y2 * scale)
+            for item in self.project.items
+            for (x1, y1), (x2, y2) in item.cut_mark_segments()
+        ]
+        if lines:
+            p.drawLines(lines)
         p.restore()
 
     def _paint_item(self, p: QPainter, item: PolaroidItem, pixmap: QPixmap | None,
@@ -810,6 +965,7 @@ class CanvasWidget(QWidget):
                 self.width() / 2 - self.project.sheet_w * new_scale / 2,
                 self.height() / 2 - self.project.sheet_h * new_scale / 2)
             self._pan = target_origin - center_term
+            self._sync_zoom_label()
             self.update()
             e.accept()
             return

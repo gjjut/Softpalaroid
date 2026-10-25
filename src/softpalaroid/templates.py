@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .model import Project
+from .model import DEFAULT_BACKGROUND_COLOR2, Project
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,8 @@ class DesignTemplate:
     saturation: float = 1.0
     sharpness: float = 1.0
     cut_marks: bool = True
+    background_style: str = "solid"
+    background_color2: str = DEFAULT_BACKGROUND_COLOR2
 
 
 DESIGN_TEMPLATES: dict[str, DesignTemplate] = {
@@ -44,6 +46,8 @@ DESIGN_TEMPLATES: dict[str, DesignTemplate] = {
         frame_colors=("#263238", "#fcfcfa"),
         filter="bw",
         contrast=1.05,
+        background_style="gradient",
+        background_color2="#263238",
     ),
     "pastel": DesignTemplate(
         key="pastel",
@@ -53,6 +57,8 @@ DESIGN_TEMPLATES: dict[str, DesignTemplate] = {
         filter="faded",
         brightness=1.03,
         saturation=0.94,
+        background_style="dots",
+        background_color2="#ffe1e8",
     ),
     "bright_album": DesignTemplate(
         key="bright_album",
@@ -62,6 +68,8 @@ DESIGN_TEMPLATES: dict[str, DesignTemplate] = {
         filter="warm",
         saturation=1.12,
         sharpness=1.08,
+        background_style="gradient",
+        background_color2="#ffffff",
     ),
 }
 
@@ -78,6 +86,8 @@ def apply_design_template(project: Project, key: str, *,
     template = get_design_template(key)
     project.template = template.key
     project.background_color = template.background_color
+    project.background_style = template.background_style
+    project.background_color2 = template.background_color2
     project.cut_marks = template.cut_marks
     project.clamp_settings()
     for index, item in enumerate(project.items):

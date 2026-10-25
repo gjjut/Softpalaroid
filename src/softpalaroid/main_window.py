@@ -8,6 +8,7 @@ from datetime import datetime
 
 from PIL import Image as PilImage, ImageDraw as PilDraw, UnidentifiedImageError
 from PySide6.QtCore import (
+    QPointF,
     QRect,
     QRectF,
     QSettings,
@@ -27,6 +28,7 @@ from PySide6.QtGui import (
     QDropEvent,
     QIcon,
     QImage,
+    QLinearGradient,
     QKeySequence,
     QPageSize,
     QPainter,
@@ -69,6 +71,7 @@ from .batch import BatchOptions, export_batch
 from .dialogs import BatchDialog, PreflightDialog
 from .filters import FILTERS, apply_filter
 from .model import (
+    BACKGROUND_STYLES,
     CARD_FORMATS,
     MAX_CARDS,
     PAPER_LABELS,
@@ -94,6 +97,7 @@ from .preflight import analyze_project, issue_counts
 from .render import render_sheet, save_card, save_sheet
 from .templates import DESIGN_TEMPLATES, apply_design_template
 from .resources import asset_path
+from .theme import current_theme, set_theme
 from .widgets import ChoiceItem, CollapsibleCard, VisualChoiceStrip
 
 IMAGE_FILTER = image_file_filter()
@@ -153,6 +157,8 @@ class MainWindow(QMainWindow):
 
         self.canvas = CanvasWidget()
         self.canvas.set_project(self.project)
+        self._ui_theme = current_theme()
+        self.canvas.set_ui_theme(self._ui_theme)
         self.canvas.selectionChanged.connect(lambda _i: self._sync_panel())
         self.canvas.itemChanged.connect(self._sync_panel)
         self.canvas.itemChanged.connect(self._update_project_ui)
@@ -304,6 +310,8 @@ class MainWindow(QMainWindow):
             "card_format": self.project.card_format,
             "template": self.project.template,
             "background_color": self.project.background_color,
+            "background_style": self.project.background_style,
+            "background_color2": self.project.background_color2,
             "cut_marks": self.project.cut_marks,
             "safe_margin_mm": self.project.safe_margin_mm,
             "show_safe_area": self.project.show_safe_area,
@@ -346,6 +354,13 @@ class MainWindow(QMainWindow):
         background = str(value("background_color", project.background_color))
         if background.startswith("#"):
             project.background_color = background
+        background_style = str(
+            value("background_style", project.background_style))
+        if background_style in BACKGROUND_STYLES:
+            project.background_style = background_style
+        background2 = str(value("background_color2", project.background_color2))
+        if background2.startswith("#"):
+            project.background_color2 = background2
         project.cut_marks = self._as_setting_bool(
             value("cut_marks", project.cut_marks), project.cut_marks)
         project.safe_margin_mm = self._as_setting_float(
@@ -456,6 +471,16 @@ class MainWindow(QMainWindow):
         version.setObjectName("versionChip")
         lay.addWidget(version)
 
+        self.theme_button = QPushButton()
+        self.theme_button.setMinimumHeight(42)
+        self.theme_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.theme_button.setToolTip(
+            "Переключить светлую или тёмную тему интерфейса")
+        self.theme_button.setAccessibleName("Тема интерфейса")
+        self.theme_button.clicked.connect(self._toggle_theme)
+        self._sync_theme_button()
+        lay.addWidget(self.theme_button)
+
         self._undo_button = QToolButton()
         self._undo_button.setObjectName("moreButton")
         self._undo_button.setText("↶")
@@ -528,6 +553,28 @@ class MainWindow(QMainWindow):
         return header
 
     # ---------------------------------------------------------------- панель
+    def _sync_theme_button(self) -> None:
+        if hasattr(self, "theme_button"):
+            self.theme_button.setText(
+                "Тема: тёмная" if self._ui_theme == "dark"
+                else "Тема: светлая")
+
+    def _toggle_theme(self) -> None:
+        target = "light" if self._ui_theme == "dark" else "dark"
+        app = QApplication.instance()
+        self._ui_theme = set_theme(app, target) if app is not None else target
+        self.canvas.set_ui_theme(self._ui_theme)
+        self._sync_theme_button()
+        if hasattr(self, "format_gallery"):
+            self.format_gallery.set_choices(
+                self._make_card_format_choices(),
+                current=self.project.card_format)
+        self._sync_layout_controls()
+        self._sync_panel()
+        self.statusBar().showMessage(
+            "Включена светлая тема" if self._ui_theme == "light"
+            else "Включена тёмная тема", 3000)
+
     @staticmethod
     def _field_label(text: str) -> QLabel:
         label = QLabel(text)
@@ -642,13 +689,13 @@ class MainWindow(QMainWindow):
         return QIcon(QPixmap.fromImage(qimage))
 
     @staticmethod
-    def _choice_pixmap() -> QPixmap:
+    def _choice_pixmap(theme: str = "dark") -> QPixmap:
         pixmap = QPixmap(144, 92)
-        pixmap.fill(QColor("#111418"))
+        pixmap.fill(QColor("#111418" if theme == "dark" else "#EFF3F4"))
         return pixmap
 
     def _paper_icon(self, key: str) -> QIcon:
-        pixmap = self._choice_pixmap()
+        pixmap = self._choice_pixmap(self._ui_theme)
         if key == "custom":
             width_cm = self.project.sheet_width_cm
             height_cm = self.project.sheet_height_cm
@@ -680,8 +727,8 @@ class MainWindow(QMainWindow):
         return QIcon(pixmap)
 
     @staticmethod
-    def _card_format_icon(spec) -> QIcon:
-        pixmap = MainWindow._choice_pixmap()
+    def _card_format_icon(spec, theme: str = "dark") -> QIcon:
+        pixmap = MainWindow._choice_pixmap(theme)
         height = 68.0
         width = height / spec.frame_ratio
         if width > 112.0:
@@ -770,7 +817,7 @@ class MainWindow(QMainWindow):
         }
         return [
             ChoiceItem(spec.key, labels.get(spec.key, spec.name),
-                       self._card_format_icon(spec), spec.name)
+                       self._card_format_icon(spec, self._ui_theme), spec.name)
             for spec in CARD_FORMATS.values()
         ]
 
@@ -786,6 +833,62 @@ class MainWindow(QMainWindow):
             ChoiceItem(template.key, labels.get(template.key, template.name),
                        self._template_icon(template), template.name)
             for template in DESIGN_TEMPLATES.values()
+        ]
+
+    def _background_icon(self, style: str) -> QIcon:
+        pixmap = QPixmap(144, 92)
+        color1 = QColor(self.project.background_color)
+        color2 = QColor(self.project.background_color2)
+        pixmap.fill(color1)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if style == "gradient":
+            gradient = QLinearGradient(0.0, 0.0, 0.0, 92.0)
+            gradient.setColorAt(0.0, color1)
+            gradient.setColorAt(1.0, color2)
+            painter.fillRect(pixmap.rect(), QBrush(gradient))
+        elif style == "dots":
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(color2))
+            row = 0
+            y = 10.0
+            while y < 92:
+                x = 10.0 + (9.0 if row % 2 else 0.0)
+                while x < 144:
+                    painter.drawEllipse(QRectF(x - 3.2, y - 3.2, 6.4, 6.4))
+                    x += 18.0
+                y += 18.0
+                row += 1
+        elif style == "grid":
+            painter.setPen(QPen(color2, 1.6))
+            x = 0.0
+            while x <= 144:
+                painter.drawLine(QPointF(x, 0.0), QPointF(x, 92.0))
+                x += 18.0
+            y = 0.0
+            while y <= 92:
+                painter.drawLine(QPointF(0.0, y), QPointF(144.0, y))
+                y += 18.0
+        # Мини-карточка поверх фона: как будет выглядеть лист.
+        painter.setPen(QPen(QColor("#536471"), 2))
+        painter.setBrush(QBrush(QColor("#FCFCFA")))
+        painter.drawRoundedRect(QRectF(52, 16, 40, 52), 3, 3)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor("#7FC8F8")))
+        painter.drawRect(QRectF(57, 21, 30, 20))
+        painter.setBrush(QBrush(QColor("#F6C177")))
+        painter.drawRect(QRectF(57, 41, 30, 9))
+        painter.setPen(QPen(QColor("#536471"), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(QRectF(1, 1, 142, 90), 6, 6)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _make_background_choices(self) -> list[ChoiceItem]:
+        return [
+            ChoiceItem(key, label, self._background_icon(key),
+                       f"Стиль фона листа: {label}")
+            for key, label in BACKGROUND_STYLES.items()
         ]
 
     def _filter_sample_image(self) -> PilImage.Image:
@@ -911,6 +1014,10 @@ class MainWindow(QMainWindow):
             ("Показывать безопасную область", self.show_safe_button),
             ("Магнитное выравнивание", self.snap_button),
             ("Фон листа", self.background_button),
+            ("Стиль фона листа", self.background_gallery),
+            ("Второй цвет фона", self.background2_button),
+            ("Выравнивание карточек", self.align_buttons["left"]),
+            ("Случайный разброс карточек", self.scatter_button),
             ("Размер карточки", self.card_size_spin),
             ("Наклон карточки", self.rot_spin),
             ("Масштаб фотографии", self.zoom_spin),
@@ -993,9 +1100,9 @@ class MainWindow(QMainWindow):
             self.panel_search.selectAll()
 
     @staticmethod
-    def _placeholder_slot_icon(symbol: str = "+") -> QIcon:
+    def _placeholder_slot_icon(symbol: str = "+", theme: str = "dark") -> QIcon:
         pixmap = QPixmap(96, 68)
-        pixmap.fill(QColor("#16181C"))
+        pixmap.fill(QColor("#16181C" if theme == "dark" else "#F7F9F9"))
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(QColor("#536471"), 2, Qt.PenStyle.DashLine))
@@ -1095,7 +1202,8 @@ class MainWindow(QMainWindow):
                 f"Карточка {index + 1}: {detail}"
                 + (f"\n{name}" if name else ""))
             icon_key = (
-                state, item.photo_path, tuple(item.photo_size or ()),
+                state, self._ui_theme, item.photo_path,
+                tuple(item.photo_size or ()),
                 item.filter, item.filter_intensity, item.brightness,
                 item.contrast, item.saturation, item.sharpness,
                 item.photo_rotation, item.flip_horizontal,
@@ -1112,7 +1220,7 @@ class MainWindow(QMainWindow):
                     button.setIcon(QIcon(scaled.copy(left, top, 96, 68)))
                 else:
                     button.setIcon(self._placeholder_slot_icon(
-                        "!" if state == "error" else "+"))
+                        "!" if state == "error" else "+", self._ui_theme))
                 self._slot_icon_keys[index] = icon_key
 
         if 0 <= selected < len(self._slot_buttons):
@@ -1273,6 +1381,45 @@ class MainWindow(QMainWindow):
         btn_reset_layout.clicked.connect(self._reset_layout)
         gl.addWidget(btn_reset_layout)
 
+        gl.addWidget(self._field_label("Выравнивание карточек"))
+        align_grid = QGridLayout()
+        align_grid.setSpacing(8)
+        self.align_buttons: dict[str, QPushButton] = {}
+        for i, (text, mode) in enumerate((
+                ("Слева", "left"), ("По центру", "center_x"),
+                ("Справа", "right"), ("Сверху", "top"),
+                ("По середине", "center_y"), ("Снизу", "bottom"))):
+            align_btn = self._ghost_button(text, 34)
+            align_btn.clicked.connect(
+                lambda _checked=False, m=mode:
+                self._arrange_cards("align", m))
+            self.align_buttons[mode] = align_btn
+            align_grid.addWidget(align_btn, i // 3, i % 3)
+        gl.addLayout(align_grid)
+        self.distribute_x_button = self._ghost_button(
+            "Равномерные промежутки по горизонтали", 34)
+        self.distribute_x_button.clicked.connect(
+            lambda: self._arrange_cards("distribute", "x"))
+        gl.addWidget(self.distribute_x_button)
+        self.distribute_y_button = self._ghost_button(
+            "Равномерные промежутки по вертикали", 34)
+        self.distribute_y_button.clicked.connect(
+            lambda: self._arrange_cards("distribute", "y"))
+        gl.addWidget(self.distribute_y_button)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.scatter_button = self._ghost_button("Случайный разброс", 34)
+        self.scatter_button.setToolTip(
+            "Небольшие случайные наклоны и сдвиги всех карточек")
+        self.scatter_button.clicked.connect(
+            lambda: self._arrange_cards("scatter"))
+        row.addWidget(self.scatter_button, 1)
+        self.straighten_button = self._ghost_button("Наклон 0° всем", 34)
+        self.straighten_button.clicked.connect(
+            lambda: self._arrange_cards("straighten"))
+        row.addWidget(self.straighten_button, 1)
+        gl.addLayout(row)
+
         self.cut_marks_button = self._segment_button("Уголки обреза на макете")
         self.cut_marks_button.setChecked(True)
         self.cut_marks_button.setToolTip(
@@ -1316,6 +1463,25 @@ class MainWindow(QMainWindow):
         gl.addWidget(self.background_button)
         gl.addWidget(self._make_swatch_row(
             SHEET_COLOR_PRESETS, self._set_background_color))
+
+        gl.addWidget(self._field_label("Стиль фона"))
+        self.background_gallery = VisualChoiceStrip()
+        self.background_gallery.set_choices(
+            self._make_background_choices(),
+            current=self.project.background_style)
+        self._background_gallery_state = (
+            self.project.background_color, self.project.background_color2,
+            self._ui_theme)
+        self.background_gallery.selected.connect(
+            lambda key: self._set_project_setting(background_style=key))
+        gl.addWidget(self.background_gallery)
+
+        gl.addWidget(self._field_label("Второй цвет фона"))
+        self.background2_button = self._color_button()
+        self.background2_button.clicked.connect(self._choose_background_color2)
+        gl.addWidget(self.background2_button)
+        gl.addWidget(self._make_swatch_row(
+            SHEET_COLOR_PRESETS, self._set_background_color2))
         lay.addWidget(sheet_card)
 
         # --- Выбранный полароид ---
@@ -1588,6 +1754,7 @@ class MainWindow(QMainWindow):
             "Колесо — масштаб фото\n"
             "Shift + колесо — наклон\n"
             "Ctrl + колесо — масштаб просмотра\n"
+            "Панель − / % / + слева внизу холста — масштаб просмотра\n"
             "Тянуть фото — сдвиг в рамке\n"
             "Тянуть рамку — двигать карточку\n"
             "Ручка сверху / Alt + тянуть — наклон\n"
@@ -1880,6 +2047,7 @@ class MainWindow(QMainWindow):
             self.cut_marks_button.setChecked(self.project.cut_marks)
             if hasattr(self, "paper_gallery"):
                 paper_key = (
+                    self._ui_theme,
                     self.project.landscape,
                     (self.project.sheet_width_cm,
                      self.project.sheet_height_cm)
@@ -1904,9 +2072,30 @@ class MainWindow(QMainWindow):
         self.add_card_button.setEnabled(can_add)
         self.duplicate_card_button.setEnabled(can_add)
         self.delete_card_button.setEnabled(len(self.project.items) > 1)
+        if hasattr(self, "align_buttons"):
+            for button in self.align_buttons.values():
+                button.setEnabled(len(self.project.items) >= 2)
+            self.distribute_x_button.setEnabled(len(self.project.items) >= 3)
+            self.distribute_y_button.setEnabled(len(self.project.items) >= 3)
         self._style_color_button(
             self.background_button, self.project.background_color,
             f"Фон: {self.project.background_color.upper()}")
+        self._style_color_button(
+            self.background2_button, self.project.background_color2,
+            f"Второй: {self.project.background_color2.upper()}")
+        self.background2_button.setEnabled(
+            self.project.background_style != "solid")
+        if hasattr(self, "background_gallery"):
+            bg_key = (self.project.background_color,
+                      self.project.background_color2, self._ui_theme)
+            if getattr(self, "_background_gallery_state", None) != bg_key:
+                self.background_gallery.set_choices(
+                    self._make_background_choices(),
+                    current=self.project.background_style)
+                self._background_gallery_state = bg_key
+            else:
+                self.background_gallery.set_current(
+                    self.project.background_style)
         self._refresh_slot_strip()
 
     def _apply_state(self, state: tuple[Project, int]) -> None:
@@ -2368,6 +2557,28 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Применён шаблон «{template.name}»", 3500)
 
+    def _arrange_cards(self, action: str, mode: str = "") -> None:
+        """Выравнивание/распределение/разброс всех карточек одной операцией."""
+        before = self._snapshot_state()
+        if action == "align":
+            self.project.align_items(mode)
+            message = "Карточки выровнены"
+        elif action == "distribute":
+            self.project.distribute_items(mode)
+            message = "Промежутки между карточками выровнены"
+        elif action == "scatter":
+            self.project.scatter_items()
+            message = "Карточки слегка разбросаны"
+        elif action == "straighten":
+            self.project.straighten_items()
+            message = "Наклон всех карточек сброшен"
+        else:  # pragma: no cover - защитный fallback
+            return
+        self.canvas.update()
+        self._sync_panel()
+        self._commit_change(before)
+        self.statusBar().showMessage(message, 3000)
+
     def _reset_layout(self) -> None:
         before = self._snapshot_state()
         self.project.set_layout(len(self.project.items), landscape=self.rb_land.isChecked())
@@ -2451,6 +2662,15 @@ class MainWindow(QMainWindow):
 
     def _set_background_color(self, color: str) -> None:
         self._set_project_setting(background_color=color)
+
+    def _set_background_color2(self, color: str) -> None:
+        self._set_project_setting(background_color2=color)
+
+    def _choose_background_color2(self) -> None:
+        color = self._pick_color(
+            self.project.background_color2, "Второй цвет фона листа")
+        if color:
+            self._set_background_color2(color)
 
     def _choose_background_color(self) -> None:
         color = self._pick_color(
