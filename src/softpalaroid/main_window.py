@@ -3,9 +3,16 @@ from __future__ import annotations
 
 import os
 
-from PIL import Image, UnidentifiedImageError
-from PySide6.QtCore import QRect, QSizeF, Qt
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QImage, QPainter
+from PIL import UnidentifiedImageError
+from PySide6.QtCore import QRect, QSize, QSizeF, Qt
+from PySide6.QtGui import (
+    QAction,
+    QDragEnterEvent,
+    QDropEvent,
+    QImage,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QApplication,
@@ -13,18 +20,19 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
-    QRadioButton,
     QScrollArea,
     QSlider,
     QSpinBox,
     QSplitter,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -34,6 +42,7 @@ from .canvas import CanvasWidget
 from .filters import FILTERS
 from .model import PolaroidItem, Project
 from .render import load_photo, render_sheet, save_sheet
+from .resources import asset_path
 
 IMAGE_FILTER = "Изображения (*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff);;Все файлы (*)"
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
@@ -42,8 +51,9 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(f"Softpalaroid {__version__} — полароиды на листе 10×15")
-        self.resize(1180, 760)
+        self.setWindowTitle("Softpalaroid — полароиды на листе 10×15")
+        self.resize(1260, 820)
+        self.setMinimumSize(1000, 640)
         self.setAcceptDrops(True)
 
         self.project = Project()
@@ -55,105 +65,223 @@ class MainWindow(QMainWindow):
         self.canvas.itemChanged.connect(self._sync_panel)
         self.canvas.photoLoadRequested.connect(self._load_photo_dialog)
 
-        self._build_menu()
+        self._build_actions()
         panel = self._build_panel()
+
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._build_header())
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.canvas)
         splitter.addWidget(panel)
         splitter.setStretchFactor(0, 1)
-        splitter.setSizes([860, 320])
-        self.setCentralWidget(splitter)
+        splitter.setHandleWidth(1)
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizes([900, 360])
+        root.addWidget(splitter, 1)
+        self.setCentralWidget(central)
 
+        self.statusBar().setSizeGripEnabled(False)
         self.statusBar().showMessage(
             "Колесо мыши — масштаб фото • Shift+колесо — наклон • "
             "Ctrl+колесо — масштаб просмотра • перетаскивание — сдвиг фото/карточки")
         self._sync_panel()
 
-    # ------------------------------------------------------------------ меню
-    def _build_menu(self) -> None:
-        file_menu = self.menuBar().addMenu("Файл")
+    # ------------------------------------------------------- действия и шапка
+    def _build_actions(self) -> None:
+        self.act_open = QAction("Загрузить фото…", self)
+        self.act_open.setShortcut("Ctrl+O")
+        self.act_open.triggered.connect(
+            lambda: self._load_photo_dialog(self._selected_index()))
 
-        act_open = QAction("Загрузить фото…", self)
-        act_open.setShortcut("Ctrl+O")
-        act_open.triggered.connect(lambda: self._load_photo_dialog(self._selected_index()))
-        file_menu.addAction(act_open)
+        self.act_save = QAction("Сохранить лист 10×15…", self)
+        self.act_save.setShortcut("Ctrl+S")
+        self.act_save.triggered.connect(self._export_dialog)
 
-        act_save = QAction("Сохранить лист 10×15…", self)
-        act_save.setShortcut("Ctrl+S")
-        act_save.triggered.connect(self._export_dialog)
-        file_menu.addAction(act_save)
+        self.act_print = QAction("Печать…", self)
+        self.act_print.setShortcut("Ctrl+P")
+        self.act_print.triggered.connect(self._print_dialog)
 
-        act_print = QAction("Печать…", self)
-        act_print.setShortcut("Ctrl+P")
-        act_print.triggered.connect(self._print_dialog)
-        file_menu.addAction(act_print)
+        self.act_about = QAction("О программе", self)
+        self.act_about.triggered.connect(self._about)
 
-        file_menu.addSeparator()
-        act_quit = QAction("Выход", self)
-        act_quit.setShortcut("Ctrl+Q")
-        act_quit.triggered.connect(self.close)
-        file_menu.addAction(act_quit)
+        self.act_quit = QAction("Выход", self)
+        self.act_quit.setShortcut("Ctrl+Q")
+        self.act_quit.triggered.connect(self.close)
 
-        help_menu = self.menuBar().addMenu("Справка")
-        act_about = QAction("О программе", self)
-        act_about.triggered.connect(self._about)
-        help_menu.addAction(act_about)
+        self.addActions([self.act_open, self.act_save, self.act_print,
+                         self.act_about, self.act_quit])
+
+    def _build_header(self) -> QFrame:
+        header = QFrame()
+        header.setObjectName("header")
+        header.setFixedHeight(68)
+        lay = QHBoxLayout(header)
+        lay.setContentsMargins(18, 10, 18, 10)
+        lay.setSpacing(12)
+
+        logo = QLabel()
+        icon = asset_path("icon.png")
+        if icon:
+            logo.setPixmap(QPixmap(icon).scaled(
+                QSize(38, 38), Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+        else:
+            logo.setText("S")
+        lay.addWidget(logo)
+
+        titles = QVBoxLayout()
+        titles.setContentsMargins(0, 0, 0, 0)
+        titles.setSpacing(0)
+        title = QLabel("Softpalaroid")
+        title.setObjectName("appTitle")
+        subtitle = QLabel("Полароиды на листе 10×15 · готово к печати")
+        subtitle.setObjectName("appSubtitle")
+        titles.addWidget(title)
+        titles.addWidget(subtitle)
+        lay.addLayout(titles)
+        lay.addStretch(1)
+
+        version = QLabel(f"v{__version__}")
+        version.setObjectName("versionChip")
+        lay.addWidget(version)
+
+        btn_print = QPushButton("Печать")
+        btn_print.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_print.setMinimumHeight(42)
+        btn_print.clicked.connect(self._print_dialog)
+        lay.addWidget(btn_print)
+
+        btn_save = QPushButton("Сохранить лист")
+        btn_save.setObjectName("primaryButton")
+        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_save.setMinimumHeight(42)
+        btn_save.clicked.connect(self._export_dialog)
+        lay.addWidget(btn_save)
+
+        more = QToolButton()
+        more.setObjectName("moreButton")
+        more.setText("···")
+        more.setCursor(Qt.CursorShape.PointingHandCursor)
+        more.setMinimumHeight(42)
+        more.setToolTip("Ещё")
+        more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(more)
+        menu.addActions([self.act_open, self.act_save, self.act_print])
+        menu.addSeparator()
+        menu.addAction(self.act_about)
+        menu.addSeparator()
+        menu.addAction(self.act_quit)
+        more.setMenu(menu)
+        lay.addWidget(more)
+        return header
 
     # ---------------------------------------------------------------- панель
+    @staticmethod
+    def _field_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setProperty("role", "field")
+        return label
+
+    @staticmethod
+    def _card(title: str) -> tuple[QFrame, QVBoxLayout]:
+        frame = QFrame()
+        frame.setProperty("card", True)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(16, 14, 16, 16)
+        layout.setSpacing(10)
+        heading = QLabel(title)
+        heading.setProperty("role", "section")
+        layout.addWidget(heading)
+        return frame, layout
+
+    @staticmethod
+    def _segment_button(text: str) -> QPushButton:
+        button = QPushButton(text)
+        button.setProperty("segment", True)
+        button.setCheckable(True)
+        button.setMinimumHeight(36)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        return button
+
+    @staticmethod
+    def _ghost_button(text: str, height: int = 36) -> QPushButton:
+        button = QPushButton(text)
+        button.setMinimumHeight(height)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        return button
+
     def _build_panel(self) -> QWidget:
         inner = QWidget()
         lay = QVBoxLayout(inner)
-        lay.setSpacing(12)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(14)
 
         # --- Лист ---
-        g_sheet = QGroupBox("Лист 10×15 см")
-        gl = QVBoxLayout(g_sheet)
-        self.rb_land = QRadioButton("Альбомная 15×10")
-        self.rb_port = QRadioButton("Книжная 10×15")
+        sheet_card, gl = self._card("Лист 10×15")
+        gl.addWidget(self._field_label("Ориентация"))
+        self.orientation_group = QButtonGroup(self)
+        self.rb_land = self._segment_button("Альбомная")
+        self.rb_port = self._segment_button("Книжная")
+        self.orientation_group.addButton(self.rb_land)
+        self.orientation_group.addButton(self.rb_port)
         self.rb_land.setChecked(True)
         self.rb_land.toggled.connect(self._orientation_changed)
         row = QHBoxLayout()
-        row.addWidget(self.rb_land)
-        row.addWidget(self.rb_port)
+        row.setSpacing(8)
+        row.addWidget(self.rb_land, 1)
+        row.addWidget(self.rb_port, 1)
         gl.addLayout(row)
 
-        gl.addWidget(QLabel("Снимков на листе:"))
+        gl.addWidget(self._field_label("Снимков на листе"))
         self.count_group = QButtonGroup(self)
         row = QHBoxLayout()
-        self.count_buttons: dict[int, QRadioButton] = {}
+        row.setSpacing(8)
+        self.count_buttons: dict[int, QPushButton] = {}
         for n in (1, 2, 4):
-            rb = QRadioButton(str(n))
-            rb.setChecked(n == 1)
-            self.count_group.addButton(rb, n)
-            self.count_buttons[n] = rb
-            row.addWidget(rb)
+            btn = self._segment_button(str(n))
+            btn.setChecked(n == 1)
+            self.count_group.addButton(btn, n)
+            self.count_buttons[n] = btn
+            row.addWidget(btn, 1)
         self.count_group.idToggled.connect(
             lambda count, checked: checked and self._count_changed(count))
         gl.addLayout(row)
 
-        btn_reset_layout = QPushButton("Сбросить расположение")
+        btn_reset_layout = self._ghost_button("Сбросить расположение")
         btn_reset_layout.clicked.connect(self._reset_layout)
         gl.addWidget(btn_reset_layout)
-        lay.addWidget(g_sheet)
+        lay.addWidget(sheet_card)
 
         # --- Выбранный полароид ---
-        g_item = QGroupBox("Выбранный полароид")
-        il = QVBoxLayout(g_item)
-        self.slot_label = QLabel("Слот 1")
-        self.slot_label.setStyleSheet("font-weight: 600;")
-        il.addWidget(self.slot_label)
+        item_card, il = self._card("Полароид")
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.slot_label = QLabel("Слот 1 / 1")
+        self.slot_label.setObjectName("slotChip")
+        self.slot_state = QLabel("Без фото")
+        self.slot_state.setProperty("role", "muted")
+        row.addWidget(self.slot_label)
+        row.addWidget(self.slot_state, 1)
+        il.addLayout(row)
 
-        btn_load = QPushButton("Загрузить фото…")
+        btn_load = QPushButton("+  Загрузить фото")
+        btn_load.setObjectName("whiteButton")
+        btn_load.setMinimumHeight(42)
+        btn_load.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_load.clicked.connect(lambda: self._load_photo_dialog(self._selected_index()))
         il.addWidget(btn_load)
 
-        btn_dup = QPushButton("Это же фото — во все слоты")
+        btn_dup = self._ghost_button("Это же фото — во все слоты")
         btn_dup.clicked.connect(self._duplicate_to_all)
         il.addWidget(btn_dup)
 
-        il.addWidget(QLabel("Наклон, °"))
+        il.addWidget(self._field_label("Наклон"))
         row = QHBoxLayout()
+        row.setSpacing(10)
         self.rot_slider = QSlider(Qt.Orientation.Horizontal)
         self.rot_slider.setRange(-450, 450)  # десятые градуса
         self.rot_slider.valueChanged.connect(
@@ -163,13 +291,16 @@ class MainWindow(QMainWindow):
         self.rot_spin.setSingleStep(0.5)
         self.rot_spin.setDecimals(1)
         self.rot_spin.setSuffix("°")
+        self.rot_spin.setFixedWidth(88)
+        self.rot_spin.setMinimumHeight(34)
         self.rot_spin.valueChanged.connect(lambda v: self._set_item(rotation=v))
         row.addWidget(self.rot_slider, 1)
         row.addWidget(self.rot_spin)
         il.addLayout(row)
 
-        il.addWidget(QLabel("Масштаб фото"))
+        il.addWidget(self._field_label("Масштаб фото"))
         row = QHBoxLayout()
+        row.setSpacing(10)
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
         self.zoom_slider.setRange(100, 400)
         self.zoom_slider.valueChanged.connect(
@@ -177,6 +308,8 @@ class MainWindow(QMainWindow):
         self.zoom_spin = QSpinBox()
         self.zoom_spin.setRange(100, 600)
         self.zoom_spin.setSuffix("%")
+        self.zoom_spin.setFixedWidth(88)
+        self.zoom_spin.setMinimumHeight(34)
         self.zoom_spin.valueChanged.connect(
             lambda v: self._set_item(zoom=v / 100.0))
         row.addWidget(self.zoom_slider, 1)
@@ -184,67 +317,77 @@ class MainWindow(QMainWindow):
         il.addLayout(row)
 
         row = QHBoxLayout()
-        btn_center = QPushButton("Фото по центру")
+        row.setSpacing(8)
+        btn_center = self._ghost_button("Фото по центру", 34)
         btn_center.clicked.connect(lambda: self._set_item(offset_x=0.5, offset_y=0.5))
-        btn_straight = QPushButton("Наклон 0°")
+        btn_straight = self._ghost_button("Наклон 0°", 34)
         btn_straight.clicked.connect(lambda: self._set_item(rotation=0.0))
-        row.addWidget(btn_center)
-        row.addWidget(btn_straight)
+        row.addWidget(btn_center, 1)
+        row.addWidget(btn_straight, 1)
         il.addLayout(row)
 
-        il.addWidget(QLabel("Подпись на рамке"))
+        il.addWidget(self._field_label("Подпись на рамке"))
         self.caption_edit = QLineEdit()
-        self.caption_edit.setPlaceholderText("Например: лето 2026 ♡")
+        self.caption_edit.setPlaceholderText("лето 2026")
         self.caption_edit.setMaxLength(40)
+        self.caption_edit.setMinimumHeight(40)
         self.caption_edit.textChanged.connect(
             lambda t: self._set_item(caption=t, refresh_pixmap=False))
         il.addWidget(self.caption_edit)
 
-        il.addWidget(QLabel("Фильтр в стиле плёнки"))
+        il.addWidget(self._field_label("Фильтр в стиле плёнки"))
         self.filter_combo = QComboBox()
+        self.filter_combo.setMinimumHeight(40)
+        self.filter_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         for key, title in FILTERS.items():
             self.filter_combo.addItem(title, key)
         self.filter_combo.currentIndexChanged.connect(
             lambda: self._set_item(filter=self.filter_combo.currentData()))
         il.addWidget(self.filter_combo)
-        lay.addWidget(g_item)
+        lay.addWidget(item_card)
 
         # --- Готово ---
-        g_out = QGroupBox("Готовый лист")
-        ol = QVBoxLayout(g_out)
+        out_card, ol = self._card("Готовый лист")
         self.size_label = QLabel()
-        self.size_label.setStyleSheet("color: #666;")
+        self.size_label.setProperty("role", "muted")
+        self.size_label.setWordWrap(True)
         ol.addWidget(self.size_label)
-        btn_save = QPushButton("Сохранить JPG/PNG (300 DPI)…")
-        btn_save.setMinimumHeight(38)
+        btn_save = QPushButton("Сохранить JPG/PNG · 300 DPI")
+        btn_save.setObjectName("primaryButton")
+        btn_save.setMinimumHeight(44)
+        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save.clicked.connect(self._export_dialog)
         ol.addWidget(btn_save)
-        btn_print = QPushButton("Печать 10×15…")
+        btn_print = self._ghost_button("Печать 10×15", 38)
         btn_print.clicked.connect(self._print_dialog)
         ol.addWidget(btn_print)
-        lay.addWidget(g_out)
+        lay.addWidget(out_card)
 
+        # --- Подсказки ---
+        hint_card, hl = self._card("Управление на холсте")
         hint = QLabel(
-            "<b>Управление на холсте</b><br>"
-            "Колесо — масштаб фото<br>"
-            "Shift + колесо — наклон<br>"
-            "Ctrl + колесо — масштаб просмотра<br>"
-            "Тянуть фото — сдвиг в рамке<br>"
-            "Тянуть рамку — двигать карточку<br>"
-            "Ручка сверху / Alt + тянуть — наклон<br>"
-            "Двойной клик — загрузить фото<br>"
-            "Стрелки — точный сдвиг фото<br>"
-            "Файл фото можно просто перетащить в окно")
-        hint.setStyleSheet("color:#666;")
+            "Колесо — масштаб фото\n"
+            "Shift + колесо — наклон\n"
+            "Ctrl + колесо — масштаб просмотра\n"
+            "Тянуть фото — сдвиг в рамке\n"
+            "Тянуть рамку — двигать карточку\n"
+            "Ручка сверху / Alt + тянуть — наклон\n"
+            "Двойной клик — загрузить фото\n"
+            "Стрелки — точный сдвиг фото\n\n"
+            "Файл фото можно просто перетащить в окно.")
+        hint.setProperty("role", "muted")
         hint.setWordWrap(True)
-        lay.addWidget(hint)
+        hl.addWidget(hint)
+        lay.addWidget(hint_card)
         lay.addStretch(1)
 
         scroll = QScrollArea()
+        scroll.setObjectName("inspector")
         scroll.setWidget(inner)
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(330)
+        scroll.setFixedWidth(356)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         return scroll
 
     # ------------------------------------------------------------- помощники
@@ -269,8 +412,8 @@ class MainWindow(QMainWindow):
             return
         item = self._item()
         self.slot_label.setText(
-            f"Слот {self._selected_index() + 1} из {len(self.project.items)}"
-            + ("" if item.photo_path else " — фото не загружено"))
+            f"Слот {self._selected_index() + 1} / {len(self.project.items)}")
+        self.slot_state.setText("Фото загружено" if item.photo_path else "Без фото")
         w_cm, h_cm = (15, 10) if self.project.landscape else (10, 15)
         self.size_label.setText(
             f"Файл: {self.project.sheet_w}×{self.project.sheet_h} px\n"
@@ -333,7 +476,8 @@ class MainWindow(QMainWindow):
         item.filter, item.caption = keep_filter, keep_caption
         self.canvas.refresh_item_pixmap(slot)
         self._sync_panel()
-        self.statusBar().showMessage(f"Фото загружено в слот {slot + 1}: {path}", 5000)
+        self.statusBar().showMessage(
+            f"Фото добавлено в слот {slot + 1}: {os.path.basename(path)}", 5000)
         return True
 
     def _duplicate_to_all(self) -> None:
@@ -422,7 +566,8 @@ class MainWindow(QMainWindow):
             "Создание полароидных снимков из фотографий и их раскладка "
             "на листе 10×15 см для печати (300 DPI).<br><br>"
             "Наклон, масштаб и сдвиг фото редактируются прямо "
-            "в окне предпросмотра — мышью и с панели справа.")
+            "в окне предпросмотра — мышью и с панели справа.<br><br>"
+            "Тёмный интерфейс в стиле X. Шрифты: Inter и Caveat (OFL).")
 
     # ---------------------------------------------------------- drag & drop
     def dragEnterEvent(self, e: QDragEnterEvent) -> None:  # noqa: N802

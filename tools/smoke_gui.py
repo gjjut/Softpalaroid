@@ -13,10 +13,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from PIL import Image, ImageDraw  # noqa: E402
+from PySide6.QtGui import QFontDatabase  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from softpalaroid.main_window import MainWindow  # noqa: E402
 from softpalaroid.render import save_sheet  # noqa: E402
+from softpalaroid.theme import apply_theme  # noqa: E402
 
 
 def _stage(name: str) -> None:
@@ -24,8 +26,15 @@ def _stage(name: str) -> None:
 
 
 def main() -> None:
-    _stage("QApplication + MainWindow")
+    _stage("QApplication + theme + MainWindow")
     app = QApplication(sys.argv)
+    apply_theme(app)
+    families = QFontDatabase.families()
+    print("[smoke] Inter registered:", any(f.startswith("Inter") for f in families),
+          "| Caveat registered:", any(f.startswith("Caveat") for f in families),
+          "| app font:", app.font().family(), flush=True)
+    assert any(f.startswith("Inter") for f in families), "Inter font not registered"
+    assert any(f.startswith("Caveat") for f in families), "Caveat font not registered"
     win = MainWindow()
     win.show()
     _stage("window shown")

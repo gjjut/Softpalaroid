@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from .filters import apply_filter
 from .model import DPI, PHOTO_INSET_FRAC, PolaroidItem, Project
+from .resources import asset_path
 
 FRAME_COLOR = (252, 252, 250)
 CAPTION_COLOR = (52, 52, 58)
@@ -33,21 +34,24 @@ def load_photo(path: str) -> Image.Image:
 
 
 def _font_candidates() -> list[str]:
-    """Пути шрифтов, похожих на рукописные, по приоритету."""
+    """Пути шрифтов подписи по приоритету: сначала встроенный Caveat."""
     names: list[str] = []
+    bundled = asset_path("fonts", "Caveat.ttf")
+    if bundled:
+        names.append(bundled)
     if sys.platform == "win32":
         fonts_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
-        names = [
+        names += [
             os.path.join(fonts_dir, n)
             for n in ("segoesc.ttf", "SegoePrint.ttf", "comic.ttf", "Gabriola.ttf", "Inkfree.ttf")
         ]
     elif sys.platform == "darwin":
-        names = [
+        names += [
             "/System/Library/Fonts/Supplemental/Bradley Hand Bold.ttf",
             "/System/Library/Fonts/Supplemental/ChalkboardSE.ttc",
         ]
     else:
-        names = [
+        names += [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
         ]
@@ -57,7 +61,14 @@ def _font_candidates() -> list[str]:
 def _caption_font(size_px: int) -> ImageFont.ImageFont:
     for path in _font_candidates():
         try:
-            return ImageFont.truetype(path, size_px)
+            font = ImageFont.truetype(path, size_px)
+            if path.endswith("Caveat.ttf"):
+                # Caveat вариативный (ось Weight 400..700): 600 лучше читается.
+                try:
+                    font.set_variation_by_axes([600])
+                except Exception:  # noqa: BLE001 - останется Regular
+                    pass
+            return font
         except OSError:
             continue
     return ImageFont.load_default(size_px)
@@ -107,7 +118,7 @@ def render_card(item: PolaroidItem, photo: Image.Image | None) -> Image.Image:
     if item.caption.strip():
         bottom_top = y0 + s
         area_h = h - bottom_top
-        font = _fit_caption(draw, item.caption, w * 0.88, int(area_h * 0.42))
+        font = _fit_caption(draw, item.caption, w * 0.88, int(area_h * 0.52))
         draw.text(
             (w / 2, bottom_top + area_h / 2),
             item.caption,

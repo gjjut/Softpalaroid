@@ -38,7 +38,7 @@ from .render import CAPTION_COLOR, FRAME_COLOR, load_photo
 PREVIEW_MAX_SIDE = 1200  # px: разрешение фото для превью (экспорт всегда в полном)
 
 _CAPTION_FAMILIES = [
-    "Segoe Script", "Segoe Print", "Ink Free", "Comic Sans MS",
+    "Caveat", "Segoe Script", "Segoe Print", "Ink Free", "Comic Sans MS",
     "Bradley Hand", "Chalkboard SE", "DejaVu Sans",
 ]
 
@@ -46,6 +46,7 @@ _CAPTION_FAMILIES = [
 def _caption_qfont(pixel_size: int) -> QFont:
     font = QFont()
     font.setFamilies(_CAPTION_FAMILIES)
+    font.setWeight(QFont.Weight.DemiBold)
     font.setPixelSize(max(8, pixel_size))
     return font
 
@@ -208,7 +209,13 @@ class CanvasWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        p.fillRect(self.rect(), QColor("#3b4046"))
+        p.fillRect(self.rect(), QColor("#000000"))
+        # Едва заметная точечная сетка рабочего пространства
+        p.setPen(QPen(QColor("#17191c"), 2))
+        step = 28
+        for gx in range(step, self.width(), step):
+            for gy in range(step, self.height(), step):
+                p.drawPoint(gx, gy)
 
         if self.project is None:
             return
@@ -218,9 +225,12 @@ class CanvasWidget(QWidget):
             origin.x(), origin.y(),
             self.project.sheet_w * scale, self.project.sheet_h * scale,
         )
-        # Тень листа и сам лист
-        p.fillRect(sheet_rect.translated(0, 6), QColor(0, 0, 0, 90))
+        # «Свечение»-подложка, контур и сам лист
+        p.fillRect(sheet_rect.adjusted(-10, -10, 10, 10), QColor(255, 255, 255, 10))
         p.fillRect(sheet_rect, QColor("#ffffff"))
+        p.setPen(QPen(QColor("#2f3336"), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(sheet_rect)
 
         for i, item in enumerate(self.project.items):
             self._paint_item(p, item, self._pixmaps.get(i), origin, scale)
@@ -269,7 +279,7 @@ class CanvasWidget(QWidget):
             font.setPixelSize(max(10, int(w * 0.042)))
             p.setFont(font)
             p.drawText(photo_rect, Qt.AlignmentFlag.AlignCenter,
-                       "Двойной клик,\nчтобы добавить фото")
+                       "+ Добавить фото\n\nдвойной клик или перетаскивание файла")
 
         p.setPen(QPen(QColor(0, 0, 0, 46), max(0.8, 1.1 / scale)))
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -277,7 +287,7 @@ class CanvasWidget(QWidget):
 
         if item.caption.strip():
             area = QRectF(0, py + s, w, h - (py + s))
-            size = int(area.height() * 0.42)
+            size = int(area.height() * 0.52)
             font = _caption_qfont(size)
             while size > 9 and QFontMetricsF(font).horizontalAdvance(item.caption) > w * 0.88:
                 size = int(size * 0.9)
@@ -291,7 +301,7 @@ class CanvasWidget(QWidget):
     def _paint_selection(self, p: QPainter, item: PolaroidItem,
                          origin: QPointF, scale: float) -> None:
         w, h = item.width, item.height
-        accent = QColor("#2f7cf6")
+        accent = QColor("#1D9BF0")
         p.save()
         p.translate(origin.x() + item.center_x * scale, origin.y() + item.center_y * scale)
         p.scale(scale, scale)
