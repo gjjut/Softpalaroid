@@ -24,7 +24,7 @@ from .image_io import probe_image_size
 from .model import PolaroidItem, Project
 
 FORMAT_NAME = "softpalaroid-project"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 PROJECT_EXTENSION = ".softpalaroid"
 PROJECT_FILE_FILTER = "Проект Softpalaroid (*.softpalaroid);;Все файлы (*)"
 MANIFEST_NAME = "manifest.json"
@@ -58,6 +58,10 @@ def _item_state(item: PolaroidItem, photo_ref: str | None,
         "offset_y": float(item.offset_y),
         "caption": item.caption,
         "filter": item.filter,
+        "photo_rotation": int(item.photo_rotation),
+        "flip_horizontal": bool(item.flip_horizontal),
+        "flip_vertical": bool(item.flip_vertical),
+        "frame_color": item.frame_color,
     }
 
 
@@ -65,6 +69,8 @@ def project_state_dict(project: Project) -> dict:
     """JSON-совместимое состояние проекта для сравнения и истории изменений."""
     return {
         "landscape": bool(project.landscape),
+        "background_color": project.background_color,
+        "cut_marks": bool(project.cut_marks),
         "items": [
             _item_state(item, item.photo_path, use_photo_path=True)
             for item in project.items
@@ -110,6 +116,8 @@ def save_project_file(project: Project, path: str | os.PathLike,
         "app_version": __version__,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "landscape": bool(project.landscape),
+        "background_color": project.background_color,
+        "cut_marks": bool(project.cut_marks),
         "selected_index": int(selected_index),
         "items": [
             _item_state(
@@ -168,6 +176,22 @@ def _float_value(data: dict, key: str, default: float) -> float:
         return default
 
 
+def _int_value(data: dict, key: str, default: int) -> int:
+    try:
+        return int(data.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_value(data: dict, key: str, default: bool) -> bool:
+    value = data.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def load_project_file(path: str | os.PathLike,
                       extract_dir: str | os.PathLike) -> LoadedProject:
     """Загрузить проект, распаковав копии фотографий в extract_dir."""
@@ -199,7 +223,11 @@ def load_project_file(path: str | os.PathLike,
             if not isinstance(raw_items, list):
                 raise ProjectFileError("В проекте отсутствует список карточек")
 
-            project = Project(landscape=bool(manifest.get("landscape", True)))
+            project = Project(
+                landscape=_bool_value(manifest, "landscape", True),
+                background_color=str(manifest.get("background_color", "#ffffff")),
+                cut_marks=_bool_value(manifest, "cut_marks", True),
+            )
             warnings: list[str] = []
 
             for slot, raw in enumerate(raw_items, start=1):
@@ -217,6 +245,10 @@ def load_project_file(path: str | os.PathLike,
                     offset_y=_float_value(raw, "offset_y", 0.5),
                     caption=str(raw.get("caption", "")),
                     filter=str(raw.get("filter", "none")),
+                    photo_rotation=_int_value(raw, "photo_rotation", 0),
+                    flip_horizontal=_bool_value(raw, "flip_horizontal", False),
+                    flip_vertical=_bool_value(raw, "flip_vertical", False),
+                    frame_color=str(raw.get("frame_color", "#fcfcfa")),
                 )
 
                 photo_ref = raw.get("photo")

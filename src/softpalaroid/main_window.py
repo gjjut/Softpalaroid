@@ -11,6 +11,7 @@ from PySide6.QtCore import QRect, QSettings, QSize, QSizeF, QStandardPaths, QTim
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
+    QColor,
     QDragEnterEvent,
     QDropEvent,
     QImage,
@@ -22,10 +23,12 @@ from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -45,7 +48,7 @@ from PySide6.QtWidgets import (
 from . import __version__
 from .canvas import CanvasWidget
 from .filters import FILTERS
-from .model import PolaroidItem, Project
+from .model import MAX_CARDS, PX_PER_CM, PolaroidItem, Project
 from .project_io import (
     PROJECT_EXTENSION,
     PROJECT_FILE_FILTER,
@@ -59,6 +62,8 @@ from .render import render_sheet, save_sheet
 from .resources import asset_path
 
 IMAGE_FILTER = image_file_filter()
+SHEET_COLOR_PRESETS = ("#ffffff", "#f6efe5", "#e7e9ea", "#dceeff", "#16181c")
+FRAME_COLOR_PRESETS = ("#fcfcfa", "#fff2cf", "#ffe1e8", "#dff3ff", "#263238", "#7a1f1f")
 HISTORY_LIMIT = 100
 AUTOSAVE_FILENAME = "autosave.softpalaroid"
 
@@ -103,6 +108,8 @@ class MainWindow(QMainWindow):
         self.canvas.itemChanged.connect(self._sync_panel)
         self.canvas.itemChanged.connect(self._update_project_ui)
         self.canvas.photoLoadRequested.connect(self._load_photo_dialog)
+        self.canvas.deleteRequested.connect(lambda _i: self._delete_card())
+        self.canvas.duplicateRequested.connect(lambda _i: self._duplicate_card())
         self.canvas.editStarted.connect(self._begin_canvas_edit)
         self.canvas.editFinished.connect(self._finish_canvas_edit)
 
@@ -128,7 +135,8 @@ class MainWindow(QMainWindow):
         self.statusBar().setSizeGripEnabled(False)
         self.statusBar().showMessage(
             "Колесо мыши — масштаб фото • Shift+колесо — наклон • "
-            "Ctrl+колесо — масштаб просмотра • перетаскивание — сдвиг фото/карточки")
+            "Ctrl+колесо — масштаб просмотра • Delete — удалить карточку")
+        self._sync_layout_controls()
         self._sync_panel()
         self._update_project_ui()
         self._update_history_actions()
@@ -385,6 +393,47 @@ class MainWindow(QMainWindow):
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         return button
 
+    @staticmethod
+    def _style_color_button(button: QPushButton, color: str, text: str) -> None:
+        qcolor = QColor(color)
+        foreground = "#0F1419" if qcolor.lightnessF() >= 0.58 else "#FFFFFF"
+        button.setText(text)
+        button.setStyleSheet(
+            f"background-color: {color}; color: {foreground}; "
+            "border: 1px solid #536471; border-radius: 12px; "
+            "padding: 7px 12px; font-weight: 800;")
+
+    @staticmethod
+    def _color_button() -> QPushButton:
+        button = QPushButton()
+        button.setMinimumHeight(38)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setToolTip("Выбрать произвольный цвет")
+        return button
+
+    @staticmethod
+    def _swatch_button(color: str) -> QToolButton:
+        button = QToolButton()
+        button.setFixedSize(30, 30)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setToolTip(color.upper())
+        button.setStyleSheet(
+            f"background-color: {color}; border: 1px solid #536471; "
+            "border-radius: 10px; padding: 0;")
+        return button
+
+    def _make_swatch_row(self, colors: tuple[str, ...], callback) -> QWidget:
+        wrap = QWidget()
+        row = QHBoxLayout(wrap)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(7)
+        for color in colors:
+            button = self._swatch_button(color)
+            button.clicked.connect(lambda _checked=False, c=color: callback(c))
+            row.addWidget(button)
+        row.addStretch(1)
+        return wrap
+
     def _build_panel(self) -> QWidget:
         inner = QWidget()
         lay = QVBoxLayout(inner)
@@ -408,11 +457,27 @@ class MainWindow(QMainWindow):
         gl.addLayout(row)
 
         gl.addWidget(self._field_label("Снимков на листе"))
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(1, MAX_CARDS)
+        self.count_spin.setValue(1)
+        self.count_spin.setFixedWidth(92)
+        self.count_spin.setMinimumHeight(36)
+        self.count_spin.setToolTip(
+            "Произвольное количество карточек; раскладка будет пересчитана")
+        self.count_spin.valueChanged.connect(self._count_changed)
+        count_hint = QLabel(f"произвольно: 1–{MAX_CARDS}")
+        count_hint.setProperty("role", "muted")
+        row.addWidget(self.count_spin)
+        row.addWidget(count_hint, 1)
+        gl.addLayout(row)
+
         self.count_group = QButtonGroup(self)
         row = QHBoxLayout()
         row.setSpacing(8)
         self.count_buttons: dict[int, QPushButton] = {}
-        for n in (1, 2, 4):
+        for n in (1, 2, 4, 6, 9):
             btn = self._segment_button(str(n))
             btn.setChecked(n == 1)
             self.count_group.addButton(btn, n)
@@ -422,9 +487,37 @@ class MainWindow(QMainWindow):
             lambda count, checked: checked and self._count_changed(count))
         gl.addLayout(row)
 
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.add_card_button = self._ghost_button("+ Карточка", 34)
+        self.add_card_button.clicked.connect(self._add_card)
+        self.duplicate_card_button = self._ghost_button("Дубликат", 34)
+        self.duplicate_card_button.clicked.connect(self._duplicate_card)
+        self.delete_card_button = self._ghost_button("Удалить", 34)
+        self.delete_card_button.clicked.connect(self._delete_card)
+        row.addWidget(self.add_card_button, 1)
+        row.addWidget(self.duplicate_card_button, 1)
+        row.addWidget(self.delete_card_button, 1)
+        gl.addLayout(row)
+
         btn_reset_layout = self._ghost_button("Сбросить расположение")
         btn_reset_layout.clicked.connect(self._reset_layout)
         gl.addWidget(btn_reset_layout)
+
+        self.cut_marks_button = self._segment_button("Уголки обреза на макете")
+        self.cut_marks_button.setChecked(True)
+        self.cut_marks_button.setToolTip(
+            "Короткие L-образные линии вокруг карточек в экспорте и печати")
+        self.cut_marks_button.toggled.connect(
+            lambda checked: self._set_project_setting(cut_marks=checked))
+        gl.addWidget(self.cut_marks_button)
+
+        gl.addWidget(self._field_label("Фон листа"))
+        self.background_button = self._color_button()
+        self.background_button.clicked.connect(self._choose_background_color)
+        gl.addWidget(self.background_button)
+        gl.addWidget(self._make_swatch_row(
+            SHEET_COLOR_PRESETS, self._set_background_color))
         lay.addWidget(sheet_card)
 
         # --- Выбранный полароид ---
@@ -449,6 +542,41 @@ class MainWindow(QMainWindow):
         btn_dup = self._ghost_button("Это же фото — во все слоты")
         btn_dup.clicked.connect(self._duplicate_to_all)
         il.addWidget(btn_dup)
+
+        il.addWidget(self._field_label("Размер карточки"))
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.card_size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.card_size_slider.setRange(20, 95)  # десятые сантиметра
+        self.card_size_slider.valueChanged.connect(
+            lambda v: self._set_item(width=v / 10.0 * PX_PER_CM))
+        self.card_size_spin = QDoubleSpinBox()
+        self.card_size_spin.setRange(2.0, 9.5)
+        self.card_size_spin.setDecimals(1)
+        self.card_size_spin.setSingleStep(0.1)
+        self.card_size_spin.setSuffix(" см")
+        self.card_size_spin.setFixedWidth(88)
+        self.card_size_spin.setMinimumHeight(34)
+        self.card_size_spin.valueChanged.connect(
+            lambda v: self._set_item(width=v * PX_PER_CM))
+        row.addWidget(self.card_size_slider, 1)
+        row.addWidget(self.card_size_spin)
+        il.addLayout(row)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        btn_front = self._ghost_button("Вперёд", 34)
+        btn_front.setToolTip("Переместить карточку на передний план")
+        btn_front.clicked.connect(lambda: self._move_card_to_layer(front=True))
+        btn_back = self._ghost_button("Назад", 34)
+        btn_back.setToolTip("Переместить карточку на задний план")
+        btn_back.clicked.connect(lambda: self._move_card_to_layer(front=False))
+        btn_center_card = self._ghost_button("В центр листа", 34)
+        btn_center_card.clicked.connect(self._center_card_on_sheet)
+        row.addWidget(btn_front, 1)
+        row.addWidget(btn_back, 1)
+        row.addWidget(btn_center_card, 1)
+        il.addLayout(row)
 
         il.addWidget(self._field_label("Наклон"))
         row = QHBoxLayout()
@@ -497,6 +625,28 @@ class MainWindow(QMainWindow):
         row.addWidget(btn_straight, 1)
         il.addLayout(row)
 
+        il.addWidget(self._field_label("Поворот и отражение фото"))
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        btn_photo_left = self._ghost_button("↺ Влево 90°", 34)
+        btn_photo_left.clicked.connect(lambda: self._rotate_photo(-90))
+        btn_photo_right = self._ghost_button("↻ Вправо 90°", 34)
+        btn_photo_right.clicked.connect(lambda: self._rotate_photo(90))
+        self.flip_h_button = self._segment_button("⇄ Горизонтально")
+        self.flip_h_button.toggled.connect(
+            lambda checked: self._set_item(flip_horizontal=checked))
+        self.flip_v_button = self._segment_button("⇅ Вертикально")
+        self.flip_v_button.toggled.connect(
+            lambda checked: self._set_item(flip_vertical=checked))
+        grid.addWidget(btn_photo_left, 0, 0)
+        grid.addWidget(btn_photo_right, 0, 1)
+        grid.addWidget(self.flip_h_button, 1, 0)
+        grid.addWidget(self.flip_v_button, 1, 1)
+        il.addLayout(grid)
+        self.photo_transform_label = QLabel()
+        self.photo_transform_label.setProperty("role", "muted")
+        il.addWidget(self.photo_transform_label)
+
         il.addWidget(self._field_label("Подпись на рамке"))
         self.caption_edit = QLineEdit()
         self.caption_edit.setPlaceholderText("лето 2026")
@@ -515,6 +665,16 @@ class MainWindow(QMainWindow):
         self.filter_combo.currentIndexChanged.connect(
             lambda: self._set_item(filter=self.filter_combo.currentData()))
         il.addWidget(self.filter_combo)
+
+        il.addWidget(self._field_label("Цвет рамки карточки"))
+        self.frame_color_button = self._color_button()
+        self.frame_color_button.clicked.connect(self._choose_frame_color)
+        il.addWidget(self.frame_color_button)
+        il.addWidget(self._make_swatch_row(
+            FRAME_COLOR_PRESETS, lambda color: self._set_frame_color(color)))
+        btn_frame_all = self._ghost_button("Этот цвет рамки — всем карточкам", 34)
+        btn_frame_all.clicked.connect(self._apply_frame_color_to_all)
+        il.addWidget(btn_frame_all)
         lay.addWidget(item_card)
 
         # --- Готово ---
@@ -544,8 +704,10 @@ class MainWindow(QMainWindow):
             "Тянуть рамку — двигать карточку\n"
             "Ручка сверху / Alt + тянуть — наклон\n"
             "Двойной клик — загрузить фото\n"
-            "Стрелки — точный сдвиг фото\n\n"
-            "Файл фото можно просто перетащить в окно.")
+            "Стрелки — точный сдвиг фото\n"
+            "Delete — удалить карточку, Ctrl+D — дублировать\n\n"
+            "Можно выбрать или перетащить сразу несколько фото — "
+            "новые карточки добавятся автоматически.")
         hint.setProperty("role", "muted")
         hint.setWordWrap(True)
         hl.addWidget(hint)
@@ -574,11 +736,22 @@ class MainWindow(QMainWindow):
         for name, value in fields.items():
             setattr(item, name, value)
         item.clamp()
-        if refresh_pixmap and "filter" in fields:
+        if refresh_pixmap and fields.keys() & {
+                "filter", "photo_rotation", "flip_horizontal", "flip_vertical"}:
             self.canvas.refresh_item_pixmap(self._selected_index())
         self.canvas.update()
         self._sync_panel(from_item=True)
         self._note_change(before)
+
+    def _set_project_setting(self, **fields) -> None:
+        before = self._snapshot_state()
+        for name, value in fields.items():
+            setattr(self.project, name, value)
+        self.project.clamp_settings()
+        self.canvas.update()
+        self._sync_layout_controls()
+        self._sync_panel()
+        self._commit_change(before)
 
     # -------------------------------------------- состояние, история, автосейв
     def _snapshot_state(self) -> tuple[Project, int]:
@@ -676,16 +849,33 @@ class MainWindow(QMainWindow):
     def _sync_layout_controls(self) -> None:
         if not hasattr(self, "rb_land"):
             return
-        controls = [self.rb_land, self.rb_port, *self.count_buttons.values()]
+        controls = [
+            self.rb_land, self.rb_port, self.count_spin,
+            *self.count_buttons.values(), self.cut_marks_button,
+        ]
         blockers = [c.blockSignals(True) for c in controls]
+        # При произвольном количестве ни один пресет не должен быть активен;
+        # эксклюзивная QButtonGroup не даёт программно снять все отметки.
+        self.count_group.setExclusive(False)
         try:
             self.rb_land.setChecked(self.project.landscape)
             self.rb_port.setChecked(not self.project.landscape)
-            for count, button in self.count_buttons.items():
-                button.setChecked(count == len(self.project.items))
+            count = len(self.project.items)
+            self.count_spin.setValue(count)
+            for preset, button in self.count_buttons.items():
+                button.setChecked(preset == count)
+            self.cut_marks_button.setChecked(self.project.cut_marks)
         finally:
             for control, blocked in zip(controls, blockers):
                 control.blockSignals(blocked)
+            self.count_group.setExclusive(True)
+        can_add = len(self.project.items) < MAX_CARDS
+        self.add_card_button.setEnabled(can_add)
+        self.duplicate_card_button.setEnabled(can_add)
+        self.delete_card_button.setEnabled(len(self.project.items) > 1)
+        self._style_color_button(
+            self.background_button, self.project.background_color,
+            f"Фон: {self.project.background_color.upper()}")
 
     def _apply_state(self, state: tuple[Project, int]) -> None:
         project, selected = state
@@ -693,6 +883,8 @@ class MainWindow(QMainWindow):
         self._history_timer.stop()
         try:
             self.project.landscape = project.landscape
+            self.project.background_color = project.background_color
+            self.project.cut_marks = project.cut_marks
             self.project.items = copy.deepcopy(project.items)
             if self.project.items:
                 self.canvas.selected = max(
@@ -968,24 +1160,44 @@ class MainWindow(QMainWindow):
             f"Файл: {self.project.sheet_w}×{self.project.sheet_h} px\n"
             f"Печать: {w_cm}×{h_cm} см при 300 DPI")
 
-        blockers = [w.blockSignals(True) for w in
-                    (self.rot_slider, self.rot_spin, self.zoom_slider,
-                     self.zoom_spin, self.caption_edit, self.filter_combo)]
+        widgets = (
+            self.rot_slider, self.rot_spin, self.zoom_slider, self.zoom_spin,
+            self.card_size_slider, self.card_size_spin,
+            self.flip_h_button, self.flip_v_button,
+            self.caption_edit, self.filter_combo,
+        )
+        blockers = [w.blockSignals(True) for w in widgets]
         try:
             self.rot_slider.setValue(int(round(item.rotation * 10)))
             self.rot_spin.setValue(item.rotation)
             self.zoom_slider.setValue(min(400, int(round(item.zoom * 100))))
             self.zoom_spin.setValue(int(round(item.zoom * 100)))
+            self.card_size_slider.setValue(int(round(item.width_cm * 10)))
+            self.card_size_spin.setValue(item.width_cm)
+            self.flip_h_button.setChecked(item.flip_horizontal)
+            self.flip_v_button.setChecked(item.flip_vertical)
             if self.caption_edit.text() != item.caption:
                 self.caption_edit.setText(item.caption)
             idx = self.filter_combo.findData(item.filter)
             if idx >= 0:
                 self.filter_combo.setCurrentIndex(idx)
         finally:
-            for w, b in zip((self.rot_slider, self.rot_spin, self.zoom_slider,
-                             self.zoom_spin, self.caption_edit, self.filter_combo),
-                            blockers):
+            for w, b in zip(widgets, blockers):
                 w.blockSignals(b)
+
+        transform_parts: list[str] = []
+        if item.photo_rotation:
+            transform_parts.append(f"поворот {item.photo_rotation}°")
+        if item.flip_horizontal:
+            transform_parts.append("отражение ⇄")
+        if item.flip_vertical:
+            transform_parts.append("отражение ⇅")
+        self.photo_transform_label.setText(
+            "Ориентация фото: "
+            + (", ".join(transform_parts) if transform_parts else "исходная"))
+        self._style_color_button(
+            self.frame_color_button, item.frame_color,
+            f"Рамка: {item.frame_color.upper()}")
 
     # ------------------------------------------------------------- действия
     def _orientation_changed(self, _checked: bool) -> None:
@@ -993,6 +1205,7 @@ class MainWindow(QMainWindow):
         self.project.set_layout(len(self.project.items), landscape=self.rb_land.isChecked())
         self.canvas.on_layout_changed()
         self.canvas.reset_view()
+        self._sync_layout_controls()
         self._sync_panel()
         self._commit_change(before)
 
@@ -1002,6 +1215,7 @@ class MainWindow(QMainWindow):
         if self.canvas.selected >= count:
             self.canvas.selected = 0
         self.canvas.on_layout_changed()
+        self._sync_layout_controls()
         self._sync_panel()
         self._commit_change(before)
 
@@ -1010,13 +1224,131 @@ class MainWindow(QMainWindow):
         self.project.set_layout(len(self.project.items), landscape=self.rb_land.isChecked())
         self.canvas.on_layout_changed()
         self.canvas.reset_view()
+        self._sync_layout_controls()
+        self._sync_panel()
+        self._commit_change(before)
+
+    # ------------------------------------------- карточки, цвета и фото
+    def _after_structure_changed(self, selected: int,
+                                 before: tuple[Project, int], message: str) -> None:
+        self.canvas.selected = max(
+            0, min(len(self.project.items) - 1, selected))
+        # Индексы могли сдвинуться: превью безопаснее пересоздать целиком.
+        self.canvas.refresh_all_pixmaps()
+        self._sync_layout_controls()
+        self._sync_panel()
+        self.canvas.update()
+        self._commit_change(before)
+        self.statusBar().showMessage(message, 3500)
+
+    def _add_card(self) -> None:
+        before = self._snapshot_state()
+        try:
+            index = self.project.add_item()
+        except ValueError as exc:
+            QMessageBox.information(self, "Лист заполнен", str(exc))
+            return
+        self._after_structure_changed(
+            index, before, f"Добавлена карточка {index + 1}")
+
+    def _duplicate_card(self) -> None:
+        before = self._snapshot_state()
+        try:
+            index = self.project.duplicate_item(self._selected_index())
+        except ValueError as exc:
+            QMessageBox.information(self, "Лист заполнен", str(exc))
+            return
+        self._after_structure_changed(
+            index, before, f"Карточка продублирована: слот {index + 1}")
+
+    def _delete_card(self) -> None:
+        if len(self.project.items) <= 1:
+            QMessageBox.information(
+                self, "Нельзя удалить",
+                "На листе должна остаться хотя бы одна карточка.")
+            return
+        before = self._snapshot_state()
+        index = self._selected_index()
+        self.project.remove_item(index)
+        self._after_structure_changed(
+            min(index, len(self.project.items) - 1), before,
+            "Карточка удалена")
+
+    def _move_card_to_layer(self, *, front: bool) -> None:
+        index = self._selected_index()
+        target = len(self.project.items) - 1 if front else 0
+        if index == target:
+            return
+        before = self._snapshot_state()
+        new_index = self.project.move_item(index, target)
+        self._after_structure_changed(
+            new_index, before,
+            "Карточка перемещена на передний план" if front
+            else "Карточка перемещена на задний план")
+
+    def _center_card_on_sheet(self) -> None:
+        self._set_item(
+            center_x=self.project.sheet_w / 2.0,
+            center_y=self.project.sheet_h / 2.0,
+        )
+
+    def _rotate_photo(self, delta: int) -> None:
+        item = self._item()
+        self._set_item(photo_rotation=(item.photo_rotation + delta) % 360)
+
+    def _pick_color(self, current: str, title: str) -> str | None:
+        color = QColorDialog.getColor(QColor(current), self, title)
+        return color.name() if color.isValid() else None
+
+    def _set_background_color(self, color: str) -> None:
+        self._set_project_setting(background_color=color)
+
+    def _choose_background_color(self) -> None:
+        color = self._pick_color(
+            self.project.background_color, "Цвет фона листа")
+        if color:
+            self._set_background_color(color)
+
+    def _set_frame_color(self, color: str) -> None:
+        self._set_item(frame_color=color, refresh_pixmap=False)
+
+    def _choose_frame_color(self) -> None:
+        color = self._pick_color(self._item().frame_color, "Цвет рамки карточки")
+        if color:
+            self._set_frame_color(color)
+
+    def _apply_frame_color_to_all(self) -> None:
+        before = self._snapshot_state()
+        color = self._item().frame_color
+        for item in self.project.items:
+            item.frame_color = color
+            item.clamp()
+        self.canvas.update()
+        self._sync_panel()
         self._commit_change(before)
 
     def _load_photo_dialog(self, slot: int) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите фото", "", IMAGE_FILTER)
-        if path:
-            self._load_photo_into(slot, path)
-            self.canvas.select(slot)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Выберите одно или несколько фото", "", IMAGE_FILTER)
+        if not paths:
+            return
+        before = self._snapshot_state()
+        current = slot
+        loaded = 0
+        for path in paths:
+            if current >= len(self.project.items):
+                if len(self.project.items) >= MAX_CARDS:
+                    break
+                self.project.add_item()
+            if self._load_photo_into(current, path, record_history=False):
+                loaded += 1
+                current += 1
+        if loaded:
+            self.canvas.selected = slot
+            self.canvas.on_layout_changed()
+            self._sync_layout_controls()
+            self._sync_panel()
+            self._commit_change(before)
 
     def _load_photo_into(self, slot: int, path: str,
                          *, record_history: bool = True) -> bool:
@@ -1052,6 +1384,9 @@ class MainWindow(QMainWindow):
             item.photo_path = src.photo_path
             item.photo_size = src.photo_size
             item.zoom, item.offset_x, item.offset_y = src.zoom, src.offset_x, src.offset_y
+            item.photo_rotation = src.photo_rotation
+            item.flip_horizontal = src.flip_horizontal
+            item.flip_vertical = src.flip_vertical
             item.filter = src.filter
             self.canvas.refresh_item_pixmap(i)
         self.canvas.update()
@@ -1126,8 +1461,10 @@ class MainWindow(QMainWindow):
             f"<b>Softpalaroid {__version__}</b><br><br>"
             "Создание полароидных снимков из фотографий и их раскладка "
             "на листе 10×15 см для печати (300 DPI).<br><br>"
-            "Наклон, масштаб и сдвиг фото редактируются прямо "
-            "в окне предпросмотра — мышью и с панели справа.<br><br>"
+            "Наклон, размер, масштаб, поворот и сдвиг фото редактируются "
+            "прямо в окне предпросмотра и с панели справа. "
+            "На листе может быть до 12 карточек, вокруг них печатаются "
+            "уголки обреза.<br><br>"
             "Тёмный интерфейс в стиле X. Шрифты: Inter и Caveat (OFL).")
 
     # ---------------------------------------------------------- drag & drop
@@ -1146,10 +1483,15 @@ class MainWindow(QMainWindow):
         slot = self._selected_index()
         for path in files:
             if slot >= len(self.project.items):
-                break
+                if len(self.project.items) >= MAX_CARDS:
+                    break
+                self.project.add_item()
             if self._load_photo_into(slot, path, record_history=False):
                 loaded_any = True
                 slot += 1
         if loaded_any:
+            self.canvas.on_layout_changed()
+            self._sync_layout_controls()
+            self._sync_panel()
             self._commit_change(before)
         e.acceptProposedAction()

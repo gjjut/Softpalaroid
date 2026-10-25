@@ -57,6 +57,26 @@ def _sepia(img: Image.Image) -> Image.Image:
     return Image.merge("RGB", (r, g, b))
 
 
+def transform_photo(img: Image.Image, rotation: int = 0,
+                    flip_horizontal: bool = False,
+                    flip_vertical: bool = False) -> Image.Image:
+    """Отразить и повернуть само фото на 0/90/180/270° по часовой стрелке."""
+    out = img
+    if flip_horizontal:
+        out = out.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    if flip_vertical:
+        out = out.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+
+    turns = int(round(rotation / 90.0)) % 4
+    if turns == 1:       # 90° по часовой = 270° против часовой в Pillow
+        out = out.transpose(Image.Transpose.ROTATE_270)
+    elif turns == 2:
+        out = out.transpose(Image.Transpose.ROTATE_180)
+    elif turns == 3:     # 270° по часовой
+        out = out.transpose(Image.Transpose.ROTATE_90)
+    return out
+
+
 def apply_filter(img: Image.Image, name: str) -> Image.Image:
     """Применить фильтр по ключу. img ожидается в режиме RGB."""
     if name == "none" or name not in FILTERS:

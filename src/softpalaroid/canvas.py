@@ -8,6 +8,7 @@
 - перетаскивание белой рамки       — перемещение карточки по листу
 - Alt + перетаскивание / ручка ⤾   — наклон карточки
 - двойной клик по карточке         — загрузить фото
+- Delete / Ctrl+D                  — удалить / дублировать карточку
 - перетаскивание пустого места     — прокрутка просмотра (когда увеличено)
 """
 from __future__ import annotations
@@ -32,10 +33,15 @@ from PySide6.QtGui import (
 from PIL import UnidentifiedImageError
 from PySide6.QtWidgets import QWidget
 
-from .filters import apply_filter
-from .model import PHOTO_INSET_FRAC, PolaroidItem, Project
+from .filters import apply_filter, transform_photo
 from .image_io import load_photo
-from .render import CAPTION_COLOR, FRAME_COLOR
+from .model import (
+    CUT_MARK_WIDTH_PX,
+    PHOTO_INSET_FRAC,
+    PolaroidItem,
+    Project,
+    cut_mark_rgb,
+)
 
 PREVIEW_MAX_SIDE = 1200  # px: разрешение фото для превью (экспорт всегда в полном)
 
@@ -65,6 +71,8 @@ class CanvasWidget(QWidget):
     selectionChanged = Signal(int)
     itemChanged = Signal()
     photoLoadRequested = Signal(int)
+    deleteRequested = Signal(int)
+    duplicateRequested = Signal(int)
     editStarted = Signal()
     editFinished = Signal()
 
@@ -131,6 +139,12 @@ class CanvasWidget(QWidget):
             return
         item.photo_size = img.size
         img.thumbnail((PREVIEW_MAX_SIDE, PREVIEW_MAX_SIDE))
+        img = transform_photo(
+            img,
+            rotation=item.photo_rotation,
+            flip_horizontal=item.flip_horizontal,
+            flip_vertical=item.flip_vertical,
+        )
         img = apply_filter(img, item.filter)
         qimg = QImage(
             img.tobytes(), img.width, img.height, img.width * 3,
@@ -243,18 +257,38 @@ class CanvasWidget(QWidget):
             origin.x(), origin.y(),
             self.project.sheet_w * scale, self.project.sheet_h * scale,
         )
-        # «Свечение»-подложка, контур и сам лист
+        # «Свечение»-подложка рабочего пространства, контур и сам лист
         p.fillRect(sheet_rect.adjusted(-10, -10, 10, 10), QColor(255, 255, 255, 10))
-        p.fillRect(sheet_rect, QColor("#ffffff"))
+        p.fillRect(sheet_rect, QColor(self.project.background_color))
         p.setPen(QPen(QColor("#2f3336"), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(sheet_rect)
+        self._paint_cut_marks(p, origin, scale)
 
         for i, item in enumerate(self.project.items):
             self._paint_item(p, item, self._pixmaps.get(i), origin, scale)
 
         if self.project.items:
             self._paint_selection(p, self.project.items[self.selected], origin, scale)
+
+    def _paint_cut_marks(self, p: QPainter,
+                         origin: QPointF, scale: float) -> None:
+        """Уголки обреза на макете: как в финальном файле и печати."""
+        if self.project is None or not self.project.cut_marks:
+            return
+        color = QColor(*cut_mark_rgb(self.project.background_color))
+        pen = QPen(color, max(1.0, CUT_MARK_WIDTH_PX * scale))
+        pen.setCapStyle(Qt.PenCapStyle.SquareCap)
+        p.save()
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for item in self.project.items:
+            for (x1, y1), (x2, y2) in item.cut_mark_segments():
+                p.drawLine(
+                    QPointF(origin.x() + x1 * scale, origin.y() + y1 * scale),
+                    QPointF(origin.x() + x2 * scale, origin.y() + y2 * scale),
+                )
+        p.restore()
 
     def _paint_item(self, p: QPainter, item: PolaroidItem, pixmap: QPixmap | None,
                     origin: QPointF, scale: float) -> None:
@@ -269,14 +303,9 @@ class CanvasWidget(QWidget):
         frame = QPainterPath()
         frame.addRoundedRect(QRectF(0, 0, w, h), radius, radius)
 
-        # Тень
-        p.save()
-        p.translate(0, w * 0.018 + 4)
-        p.fillPath(frame, QBrush(QColor(0, 0, 0, 60)))
-        p.restore()
-
-        p.fillPath(frame, QBrush(QColor(*FRAME_COLOR)))
-        p.setPen(QPen(QColor(0, 0, 0, 34), max(0.8, 1.1 / scale)))
+        # Без тени: плоская карточка и тонкий нейтральный контур.
+        p.fillPath(frame, QBrush(QColor(item.frame_color)))
+        p.setPen(QPen(QColor(*item.contrast_rgb, 42), max(0.8, 1.1 / scale)))
         p.drawPath(frame)
 
         px, py, s, _ = item.photo_rect_local()
@@ -299,7 +328,7 @@ class CanvasWidget(QWidget):
             p.drawText(photo_rect, Qt.AlignmentFlag.AlignCenter,
                        "+ Добавить фото\n\nдвойной клик или перетаскивание файла")
 
-        p.setPen(QPen(QColor(0, 0, 0, 46), max(0.8, 1.1 / scale)))
+        p.setPen(QPen(QColor(*item.contrast_rgb, 46), max(0.8, 1.1 / scale)))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(photo_rect)
 
@@ -311,7 +340,7 @@ class CanvasWidget(QWidget):
                 size = int(size * 0.9)
                 font = _caption_qfont(size)
             p.setFont(font)
-            p.setPen(QColor(*CAPTION_COLOR))
+            p.setPen(QColor(*item.caption_rgb))
             p.drawText(area, Qt.AlignmentFlag.AlignCenter, item.caption)
 
         p.restore()
@@ -529,6 +558,14 @@ class CanvasWidget(QWidget):
         step = 0.1 if e.modifiers() & Qt.KeyboardModifier.ShiftModifier else 0.02
         item = self.project.items[self.selected]
         key = e.key()
+        if key == Qt.Key.Key_Delete:
+            self.deleteRequested.emit(self.selected)
+            e.accept()
+            return
+        if key == Qt.Key.Key_D and e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.duplicateRequested.emit(self.selected)
+            e.accept()
+            return
         if key in {Qt.Key.Key_Left, Qt.Key.Key_Right,
                    Qt.Key.Key_Up, Qt.Key.Key_Down}:
             self.editStarted.emit()

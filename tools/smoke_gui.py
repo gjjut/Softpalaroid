@@ -49,6 +49,11 @@ def main() -> None:
         d.rectangle([0, 560, 1000, 800], fill=(80, 150, 90))
         img.save(photo, quality=90)
 
+        # Произвольное количество: 3 не является пресетом.
+        win._count_changed(3)  # noqa: SLF001
+        assert win.count_spin.value() == 3
+        assert not any(b.isChecked() for b in win.count_buttons.values())
+
         # Книжная ориентация, 4 снимка, одно фото на все слоты
         win.project.set_layout(4, landscape=False)
         win.canvas.on_layout_changed()
@@ -59,6 +64,12 @@ def main() -> None:
             item.caption = f"Слот {i + 1}"
             item.filter = "vintage"
             win.canvas.refresh_item_pixmap(i)
+
+        win.canvas.select(0)
+        win._set_background_color("#f6efe5")  # noqa: SLF001
+        win._set_frame_color("#fff2cf")  # noqa: SLF001
+        win._rotate_photo(90)  # noqa: SLF001
+        assert win.project.cut_marks
 
         _stage("photos loaded, grab canvas")
         app.processEvents()
@@ -79,7 +90,24 @@ def main() -> None:
         assert win._open_project_from(  # noqa: SLF001
             project_file, confirm_discard=False)
         assert win.project.items[0].caption == original_caption
+        assert win.project.background_color == "#f6efe5"
+        assert win.project.items[0].frame_color == "#fff2cf"
+        assert win.project.items[0].photo_rotation == 90
         assert not win._is_dirty()  # noqa: SLF001
+
+        _stage("free cards add/duplicate/delete/layer")
+        win._add_card()  # noqa: SLF001
+        assert len(win.project.items) == 5
+        win._duplicate_card()  # noqa: SLF001
+        assert len(win.project.items) == 6
+        win._delete_card()  # noqa: SLF001
+        assert len(win.project.items) == 5
+        win._count_changed(4)  # noqa: SLF001
+        assert len(win.project.items) == 4
+        win.canvas.select(0)
+        moved_caption = win.project.items[0].caption
+        win._move_card_to_layer(front=True)  # noqa: SLF001
+        assert win.project.items[-1].caption == moved_caption
 
         _stage("export sheet")
         out = os.path.join(tmp, "sheet.jpg")

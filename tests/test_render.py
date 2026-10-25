@@ -13,9 +13,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from PIL import Image, ImageDraw  # noqa: E402
 
-from softpalaroid.filters import FILTERS, apply_filter  # noqa: E402
+from softpalaroid.filters import FILTERS, apply_filter, transform_photo  # noqa: E402
 from softpalaroid.model import (  # noqa: E402
+    CUT_MARK_ARM_PX,
     FRAME_RATIO,
+    MAX_CARDS,
+    PolaroidItem,
     Project,
     compute_layout,
     sheet_size_px,
@@ -39,7 +42,7 @@ class TestLayout(unittest.TestCase):
     def test_layouts_inside_sheet(self) -> None:
         for landscape in (True, False):
             w, h = sheet_size_px(landscape)
-            for count in (1, 2, 4):
+            for count in (1, 2, 3, 4, 6, 9, 12):
                 with self.subTest(landscape=landscape, count=count):
                     pos = compute_layout(count, w, h)
                     self.assertEqual(len(pos), count)
@@ -54,6 +57,96 @@ class TestLayout(unittest.TestCase):
         w, h = sheet_size_px(True)
         sizes = [compute_layout(n, w, h)[0][2] for n in (1, 2, 4)]
         self.assertTrue(sizes[0] > sizes[1] > sizes[2])
+
+
+class TestCardOperations(unittest.TestCase):
+    def test_add_duplicate_remove_and_reorder(self) -> None:
+        project = Project()
+        project.set_layout(2, landscape=True)
+        project.items[0].caption = "A"
+        project.items[1].caption = "B"
+        first_position = (project.items[0].center_x, project.items[0].center_y)
+
+        added = project.add_item()
+        self.assertEqual(added, 2)
+        self.assertEqual(len(project.items), 3)
+        self.assertEqual(
+            first_position,
+            (project.items[0].center_x, project.items[0].center_y),
+            "добавление не должно переставлять существующие карточки")
+
+        clone_index = project.duplicate_item(0)
+        self.assertEqual(clone_index, 1)
+        self.assertEqual(project.items[clone_index].caption, "A")
+        self.assertGreater(
+            project.items[clone_index].center_x, project.items[0].center_x)
+
+        moved = project.move_item(clone_index, len(project.items) - 1)
+        self.assertEqual(project.items[moved].caption, "A")
+        removed = project.remove_item(moved)
+        self.assertEqual(removed.caption, "A")
+        self.assertEqual(len(project.items), 3)
+
+    def test_card_count_limits(self) -> None:
+        project = Project()
+        project.set_layout(MAX_CARDS, landscape=True)
+        with self.assertRaises(ValueError):
+            project.add_item()
+        project.set_layout(1, landscape=True)
+        with self.assertRaises(ValueError):
+            project.remove_item(0)
+
+
+class TestPhotoTransform(unittest.TestCase):
+    def test_effective_size_and_reset_on_new_photo(self) -> None:
+        item = PolaroidItem()
+        item.set_photo("photo.jpg", (1200, 800))
+        item.photo_rotation = 90
+        item.flip_horizontal = True
+        item.clamp()
+        self.assertEqual(item.effective_photo_size(), (800, 1200))
+        item.set_photo("other.jpg", (900, 900))
+        self.assertEqual(item.photo_rotation, 0)
+        self.assertFalse(item.flip_horizontal)
+
+    def test_rotate_clockwise_and_flip_pixels(self) -> None:
+        img = Image.new("RGB", (2, 1))
+        img.putpixel((0, 0), (255, 0, 0))
+        img.putpixel((1, 0), (0, 0, 255))
+
+        rotated = transform_photo(img, rotation=90)
+        self.assertEqual(rotated.size, (1, 2))
+        self.assertEqual(rotated.getpixel((0, 0)), (255, 0, 0))
+        self.assertEqual(rotated.getpixel((0, 1)), (0, 0, 255))
+
+        flipped = transform_photo(img, flip_horizontal=True)
+        self.assertEqual(flipped.getpixel((0, 0)), (0, 0, 255))
+
+
+class TestCutMarksGeometry(unittest.TestCase):
+    def test_eight_segments_outside_card(self) -> None:
+        item = PolaroidItem(center_x=500, center_y=500, width=400)
+        segments = item.cut_mark_segments()
+        self.assertEqual(len(segments), 8)
+        left = item.center_x - item.width / 2
+        right = item.center_x + item.width / 2
+        top = item.center_y - item.height / 2
+        bottom = item.center_y + item.height / 2
+        for (x1, y1), (x2, y2) in segments:
+            self.assertTrue(
+                x1 < left or x1 > right or y1 < top or y1 > bottom,
+                (x1, y1))
+            self.assertAlmostEqual(
+                ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5,
+                CUT_MARK_ARM_PX,
+                places=5,
+            )
+
+    def test_rotated_segments_keep_arm_length(self) -> None:
+        item = PolaroidItem(center_x=500, center_y=500, width=400, rotation=30)
+        for (x1, y1), (x2, y2) in item.cut_mark_segments(arm=40):
+            self.assertAlmostEqual(
+                ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5, 40, places=5)
 
 
 class TestFilters(unittest.TestCase):
@@ -106,6 +199,65 @@ class TestRender(unittest.TestCase):
         project.set_layout(2, landscape=True)
         img = render_sheet(project)
         self.assertEqual(img.size, (1772, 1181))
+
+    def test_render_has_no_card_shadow_and_has_cut_marks(self) -> None:
+        project = Project()
+        project.set_layout(1, landscape=True)
+        item = project.items[0]
+        item.rotation = 0
+        img = render_sheet(project)
+
+        below_card = item.local_to_sheet(item.width / 2, item.height + 7)
+        self.assertEqual(
+            img.getpixel((int(below_card[0]), int(below_card[1]))),
+            (255, 255, 255),
+            "под карточкой не должно быть серой размытой тени")
+
+        (x1, y1), (x2, y2) = item.cut_mark_segments()[0]
+        mark_mid = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+        self.assertEqual(img.getpixel(mark_mid), (92, 96, 102))
+
+        project.cut_marks = False
+        without_marks = render_sheet(project)
+        self.assertEqual(without_marks.getpixel(mark_mid), (255, 255, 255))
+
+    def test_render_uses_sheet_and_frame_colors(self) -> None:
+        project = Project(background_color="#102030")
+        project.set_layout(1, landscape=True)
+        item = project.items[0]
+        item.frame_color = "#ffe1e8"
+        img = render_sheet(project)
+        self.assertEqual(img.getpixel((3, 3)), (16, 32, 48))
+        frame_point = item.local_to_sheet(item.width / 2, item.height * 0.95)
+        self.assertEqual(
+            img.getpixel((int(frame_point[0]), int(frame_point[1]))),
+            (255, 225, 232))
+
+    def test_render_rotates_photo_inside_card(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "photo.png")
+            photo = Image.new("RGB", (200, 100), (0, 0, 255))
+            ImageDraw.Draw(photo).rectangle(
+                [0, 0, 99, 99], fill=(255, 0, 0))
+            photo.save(path)
+
+            project = Project()
+            project.set_layout(1, landscape=True)
+            item = project.items[0]
+            item.set_photo(path, photo.size)
+            item.photo_rotation = 90
+            img = render_sheet(project)
+
+            inset = item.photo_rect_local()
+            top_point = item.local_to_sheet(
+                item.width / 2, inset[1] + item.photo_side * 0.25)
+            bottom_point = item.local_to_sheet(
+                item.width / 2, inset[1] + item.photo_side * 0.75)
+            top_pixel = img.getpixel((int(top_point[0]), int(top_point[1])))
+            bottom_pixel = img.getpixel(
+                (int(bottom_point[0]), int(bottom_point[1])))
+            self.assertGreater(top_pixel[0], 200)
+            self.assertGreater(bottom_pixel[2], 200)
 
 
 if __name__ == "__main__":

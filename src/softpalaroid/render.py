@@ -8,14 +8,22 @@ from __future__ import annotations
 import os
 import sys
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
-from .filters import apply_filter
+from .filters import apply_filter, transform_photo
 from .image_io import load_photo
-from .model import DPI, PHOTO_INSET_FRAC, PolaroidItem, Project
+from .model import (
+    CUT_MARK_WIDTH_PX,
+    DPI,
+    PHOTO_INSET_FRAC,
+    PolaroidItem,
+    Project,
+    color_to_rgb,
+    relative_luminance,
+)
 from .resources import asset_path
 
-FRAME_COLOR = (252, 252, 250)
+FRAME_COLOR = color_to_rgb("#fcfcfa")
 CAPTION_COLOR = (52, 52, 58)
 PLACEHOLDER_COLOR = (225, 225, 228)
 SS = 2  # supersampling карточки для гладких краёв после поворота
@@ -80,7 +88,13 @@ def render_card(item: PolaroidItem, photo: Image.Image | None) -> Image.Image:
     draw = ImageDraw.Draw(card)
 
     radius = int(w * 0.018)
-    draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=FRAME_COLOR + (255,))
+    draw.rounded_rectangle(
+        [0, 0, w - 1, h - 1],
+        radius=radius,
+        fill=item.frame_rgb + (255,),
+        outline=item.contrast_rgb + (42,),
+        width=max(1, SS),
+    )
 
     inset = item.width * PHOTO_INSET_FRAC * SS
     side = item.photo_side * SS
@@ -88,10 +102,16 @@ def render_card(item: PolaroidItem, photo: Image.Image | None) -> Image.Image:
     s = int(round(side))
 
     if photo is not None and item.photo_size:
-        iw, ih = photo.size
+        oriented = transform_photo(
+            photo,
+            rotation=item.photo_rotation,
+            flip_horizontal=item.flip_horizontal,
+            flip_vertical=item.flip_vertical,
+        )
+        iw, ih = oriented.size
         scale = max(s / iw, s / ih) * item.zoom
         dw, dh = max(1, round(iw * scale)), max(1, round(ih * scale))
-        resized = photo.resize((dw, dh), Image.LANCZOS)
+        resized = oriented.resize((dw, dh), Image.LANCZOS)
         resized = apply_filter(resized, item.filter)
         cx = int(round(item.offset_x * (dw - s)))
         cy = int(round(item.offset_y * (dh - s)))
@@ -101,7 +121,11 @@ def render_card(item: PolaroidItem, photo: Image.Image | None) -> Image.Image:
         draw.rectangle([x0, y0, x0 + s, y0 + s], fill=PLACEHOLDER_COLOR + (255,))
 
     # Тонкая внутренняя рамка вокруг фото
-    draw.rectangle([x0, y0, x0 + s - 1, y0 + s - 1], outline=(0, 0, 0, 46), width=max(1, SS))
+    draw.rectangle(
+        [x0, y0, x0 + s - 1, y0 + s - 1],
+        outline=item.contrast_rgb + (46,),
+        width=max(1, SS),
+    )
 
     if item.caption.strip():
         bottom_top = y0 + s
@@ -111,15 +135,38 @@ def render_card(item: PolaroidItem, photo: Image.Image | None) -> Image.Image:
             (w / 2, bottom_top + area_h / 2),
             item.caption,
             font=font,
-            fill=CAPTION_COLOR + (255,),
+            fill=item.caption_rgb + (255,),
             anchor="mm",
         )
     return card
 
 
-def render_sheet(project: Project, background: tuple[int, int, int] = (255, 255, 255)) -> Image.Image:
-    """Полный лист в экспортном разрешении."""
-    sheet = Image.new("RGB", (project.sheet_w, project.sheet_h), background)
+def draw_cut_marks(sheet: Image.Image, project: Project,
+                   background: tuple[int, int, int] | None = None) -> None:
+    """Нарисовать L-образные уголки обреза вокруг каждой карточки.
+
+    Метки рисуются на фон листа до самих карточек: так они видны вокруг
+    карточек, но не портят соседнюю карточку при наложении.
+    """
+    bg = project.background_rgb if background is None else background
+    mark_color = ((92, 96, 102)
+                  if relative_luminance(bg) >= 0.45
+                  else (226, 229, 233))
+    draw = ImageDraw.Draw(sheet)
+    width = max(1, int(round(CUT_MARK_WIDTH_PX)))
+    for item in project.items:
+        for start, end in item.cut_mark_segments():
+            draw.line([start, end], fill=mark_color, width=width)
+
+
+def render_sheet(project: Project,
+                 background: tuple[int, int, int] | None = None) -> Image.Image:
+    """Полный лист в экспортном разрешении (без теней карточек)."""
+    bg = project.background_rgb if background is None else background
+    sheet = Image.new("RGB", (project.sheet_w, project.sheet_h), bg)
+
+    if project.cut_marks:
+        draw_cut_marks(sheet, project, bg)
 
     for item in project.items:
         photo = load_photo(item.photo_path) if item.photo_path else None
@@ -132,16 +179,8 @@ def render_sheet(project: Project, background: tuple[int, int, int] = (255, 255,
                 (rotated.width // SS, rotated.height // SS), Image.LANCZOS
             )
 
-        # Тень по силуэту повёрнутой карточки
-        alpha = rotated.split()[3]
-        shadow = Image.new("RGBA", rotated.size, (0, 0, 0, 255))
-        shadow.putalpha(alpha.point(lambda a: int(a * 0.28)))
-        shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(3.0, item.width * 0.012)))
-
         px = int(round(item.center_x - rotated.width / 2))
         py = int(round(item.center_y - rotated.height / 2))
-        dy = int(round(item.width * 0.018)) + 4
-        sheet.paste(shadow, (px, py + dy), shadow)
         sheet.paste(rotated, (px, py), rotated)
 
     return sheet
