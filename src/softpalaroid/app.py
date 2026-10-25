@@ -9,27 +9,18 @@ from PySide6.QtWidgets import QApplication
 
 from . import APP_NAME
 from .main_window import MainWindow
-
-
-def _icon_path() -> str | None:
-    candidates = []
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        candidates.append(os.path.join(meipass, "assets", "icon.png"))
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates.append(os.path.join(here, "..", "..", "assets", "icon.png"))
-    for path in candidates:
-        if os.path.exists(path):
-            return os.path.normpath(path)
-    return None
+from .resources import asset_path
+from .theme import apply_theme
 
 
 def main(argv: list[str] | None = None) -> int:
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
     app.setOrganizationName(APP_NAME)
-    app.setStyle("Fusion")
-    icon = _icon_path()
+    apply_theme(app)
+
+    icon = asset_path("icon.png")
     if icon:
         app.setWindowIcon(QIcon(icon))
 

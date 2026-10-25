@@ -20,7 +20,7 @@ from softpalaroid.model import (  # noqa: E402
     compute_layout,
     sheet_size_px,
 )
-from softpalaroid.render import load_photo, render_sheet  # noqa: E402
+from softpalaroid.render import _caption_font, _font_candidates, load_photo, render_sheet  # noqa: E402
 
 
 def _make_photo(path: str, w: int = 1200, h: int = 900) -> None:
@@ -64,6 +64,15 @@ class TestFilters(unittest.TestCase):
                 out = apply_filter(img.copy(), name)
                 self.assertEqual(out.size, img.size)
                 self.assertEqual(out.mode, "RGB")
+
+
+class TestCaptionFont(unittest.TestCase):
+    def test_bundled_caveat_has_priority(self) -> None:
+        candidates = _font_candidates()
+        self.assertTrue(candidates, "не найден ни один шрифт подписи")
+        self.assertTrue(candidates[0].endswith("Caveat.ttf"), candidates[0])
+        font = _caption_font(60)
+        self.assertTrue(font.getname()[0].startswith("Caveat"), font.getname())
 
 
 class TestRender(unittest.TestCase):

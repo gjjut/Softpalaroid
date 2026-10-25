@@ -2,7 +2,8 @@
 
 Десктопное приложение (Windows), которое превращает обычные фотографии в
 **полароидные снимки** и раскладывает их на **листе 10×15 см** — готовом к
-печати как обычное фото (300 DPI).
+печати как обычное фото (300 DPI). Интерфейс — современный, тёмный,
+в стиле соцсети X.
 
 ![Интерфейс Softpalaroid](docs/screenshot.png)
 
@@ -12,6 +13,7 @@
 
 ## Возможности
 
+- 🖤 Современный интерфейс в стиле X: чёрная тема, шрифт Inter, акцент #1D9BF0
 - 📐 Лист 10×15 см: альбомная (15×10) или книжная (10×15) ориентация
 - 🖼️ Раскладка: **1, 2 или 4** полароида на листе (в каждое — своё фото)
 - 🖱️ Редактирование **прямо в окне предпросмотра**:
@@ -20,7 +22,7 @@
   - сдвиг фото в рамке — перетаскиванием (или стрелками клавиатуры)
   - перемещение карточки по листу — перетаскиванием за белую рамку
   - масштаб просмотра листа — `Ctrl`+колесо
-- ✍️ Подпись на белой рамке (рукописным шрифтом, если доступен)
+- ✍️ Подпись на белой рамке встроенным рукописным шрифтом Caveat (с кириллицей)
 - 🎞️ Фильтры в стиле плёнки: винтаж, тёплый, холодный, выцветшая плёнка,
   сепия, ч/б (виньетка + зерно)
 - 💾 Экспорт в **JPG/PNG с 300 DPI** — печатается как стандартное фото 10×15
@@ -85,7 +87,7 @@ pyinstaller packaging/Softpalaroid.spec --noconfirm
 
 1. Поднять версию в `src/softpalaroid/__init__.py` и `MyAppVersion` в
    `packaging/installer.iss`.
-2. `git tag v0.2.0 && git push origin v0.2.0` — GitHub Actions соберёт
+2. `git tag v0.3.0 && git push origin v0.3.0` — GitHub Actions соберёт
    установщик и прикрепит его к новому Release.
 
 ## Структура проекта
@@ -98,7 +100,11 @@ src/softpalaroid/
     render.py               — рендер листа в 300 DPI для экспорта/печати
     canvas.py               — интерактивный предпросмотр (мышь, наклон, масштаб)
     main_window.py          — главное окно и панель настроек
+    theme.py                — тёмная тема в стиле X, подключение шрифтов
+    resources.py            — пути к ресурсам assets (исходники и exe)
     app.py                  — точка входа
+assets/fonts/               — шрифты Inter и Caveat (OFL, с кириллицей)
+assets/icons/               — служебные иконки интерфейса
 packaging/
     Softpalaroid.spec       — PyInstaller (Softpalaroid.exe)
     installer.iss           — Inno Setup (установщик)
@@ -118,7 +124,7 @@ QT_QPA_PLATFORM=offscreen python tools/smoke_gui.py   # GUI-прогон
 ## Стек
 
 Python 3.11+ · [PySide6 (Qt)](https://doc.qt.io/qtforpython-6/) ·
-[Pillow](https://pillow.readthedocs.io/) ·
+[Pillow](https://pillow.readthedocs.io/) · шрифты Inter и Caveat (OFL) ·
 [PyInstaller](https://pyinstaller.org/) · [Inno Setup](https://jrsoftware.org/isinfo.php)
 
 ## Планы
